@@ -1,0 +1,323 @@
+
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#ffffff">
+
+    <title>YouTube Chatbot – Watch. Ask. Learn Smarter.</title>
+
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <!-- ===== HEADER ===== -->
+    <header class="header">
+
+        <div class="brand">
+
+            <svg class="logo" viewBox="0 0 28 20" aria-hidden="true">
+                <rect width="28" height="20" rx="5" fill="#f00" />
+                <path d="M11 5.5v9l8-4.5z" fill="#fff" />
+            </svg>
+
+            <div>
+                <h1>YouTube Chatbot</h1>
+                <p>Watch. Ask. Learn Smarter.</p>
+            </div>
+
+        </div>
+
+        <nav class="nav" id="nav" aria-label="Main navigation">
+
+            <button class="nav-btn active" data-view="home" type="button">
+                Home
+            </button>
+
+            <button class="nav-btn" data-view="history" type="button">
+                History
+            </button>
+
+            <button class="nav-btn" data-view="about" type="button">
+                About
+            </button>
+
+        </nav>
+
+        <button
+            id="themeToggle"
+            class="icon-btn"
+            type="button"
+            aria-label="Toggle dark mode"
+            title="Toggle dark mode">
+            🌙
+        </button>
+
+    </header>
+
+
+    <!-- ===== MAIN CONTENT ===== -->
+    <main class="container">
+
+        <!-- ===== HOME SECTION ===== -->
+        <section id="view-home" class="view active">
+
+            <!-- Video URL Form -->
+            <form id="videoForm" class="card load-card" novalidate>
+
+                <label for="urlInput">
+                    YouTube video link
+                </label>
+
+                <div class="load-row">
+
+                    <input
+                        id="urlInput"
+                        type="url"
+                        placeholder="https://www.youtube.com/watch?v=..."
+                        autocomplete="off"
+                        aria-describedby="urlError loadStatus"
+                    >
+
+                    <select id="languageSelect" aria-label="Answer language">
+
+                        <option value="English">English</option>
+                        <option value="Hindi">Hindi</option>
+                        <option value="Hinglish">Hinglish</option>
+
+                    </select>
+
+                    <button
+                        id="loadBtn"
+                        class="btn primary"
+                        type="submit">
+
+                        <span class="spinner" aria-hidden="true"></span>
+                        <span id="loadBtnText">Load Video</span>
+
+                    </button>
+
+                </div>
+
+                <p id="urlError" class="field-error" role="alert" hidden></p>
+
+                <p id="loadStatus" class="status" aria-live="polite" hidden></p>
+
+            </form>
+
+
+            <!-- Empty State -->
+            <div id="empty" class="card empty">
+
+                <h2>Paste a link to start learning</h2>
+
+                <p>
+                    Load a YouTube video to get an AI-generated summary
+                    and chat with the video using AI.
+                </p>
+
+            </div>
+
+
+            <!-- ===== VIDEO WORKSPACE ===== -->
+            <div id="workspace" class="workspace" hidden>
+
+                <!-- Main Column -->
+                <div class="col-main">
+
+                    <!-- Video Player -->
+                    <article class="card video-card">
+
+                        <div class="player-wrap">
+                            <div id="player"></div>
+                        </div>
+
+                        <div class="video-info">
+
+                            <img
+                                id="thumb"
+                                alt="Video thumbnail"
+                                loading="lazy"
+                            >
+
+                            <div>
+                                <h2 id="videoTitle"></h2>
+
+                                <p class="muted">
+                                    <span id="videoChannel"></span>
+                                    ·
+                                    <span id="videoDuration"></span>
+                                </p>
+                            </div>
+
+                        </div>
+
+                    </article>
+
+
+                    <!-- AI Summary -->
+                    <article class="card">
+
+                        <h3>AI Summary</h3>
+
+                        <div
+                            id="summaryLoading"
+                            class="skeleton"
+                            aria-label="Loading summary">
+
+                            <i></i>
+                            <i></i>
+                            <i></i>
+
+                        </div>
+
+                        <div id="summaryBody" hidden>
+
+                            <p id="summaryText"></p>
+
+                            <h4>Important Points</h4>
+                            <ul id="pointsList"></ul>
+
+                            <h4>Key Topics</h4>
+                            <div id="topicsList" class="chips"></div>
+
+                            <h4>Keywords</h4>
+                            <div id="keywordsList" class="chips alt"></div>
+
+                        </div>
+
+                        <p
+                            id="summaryError"
+                            class="field-error"
+                            role="alert"
+                            hidden>
+                        </p>
+
+                    </article>
+
+                </div>
+
+
+                <!-- ===== CHAT SECTION ===== -->
+                <aside class="card chat">
+
+                    <div class="card-head">
+
+                        <h3>Ask the Video</h3>
+
+                        <button
+                            id="clearChat"
+                            class="btn ghost small"
+                            type="button">
+                            Clear Chat
+                        </button>
+
+                    </div>
+
+
+                    <!-- Chat Messages -->
+                    <div
+                        id="chatMessages"
+                        class="messages"
+                        aria-live="polite"
+                        aria-relevant="additions">
+                    </div>
+
+
+                    <!-- Chat Input -->
+                    <form id="chatForm" class="chat-form">
+
+                        <textarea
+                            id="chatInput"
+                            rows="1"
+                            placeholder="Ask anything about this video..."
+                            aria-label="Your question"
+                            required
+                        ></textarea>
+
+                        <button
+                            id="sendBtn"
+                            class="btn primary"
+                            type="submit">
+                            Send
+                        </button>
+
+                    </form>
+
+                </aside>
+
+            </div>
+
+        </section>
+
+
+        <!-- ===== HISTORY SECTION ===== -->
+        <section id="view-history" class="view" hidden>
+
+            <div class="card">
+
+                <div class="card-head">
+
+                    <h3>Recent Videos</h3>
+
+                    <button
+                        id="clearHistory"
+                        class="btn ghost small"
+                        type="button">
+                        Clear History
+                    </button>
+
+                </div>
+
+                <div id="historyList"></div>
+
+            </div>
+
+        </section>
+
+
+        <!-- ===== ABOUT SECTION ===== -->
+        <section id="view-about" class="view" hidden>
+
+            <div class="card about">
+
+                <h2>About YouTube Chatbot</h2>
+
+                <p>
+                    Paste a video link and the app analyzes its captions
+                    and on-screen content so you can ask questions and
+                    get answers grounded in the video.
+                </p>
+
+                <p class="muted">
+                    Powered by LangChain, Groq, Sentence Transformers,
+                    FAISS and the YouTube APIs.
+                    Recent videos are saved only in this browser.
+                </p>
+
+            </div>
+
+        </section>
+
+    </main>
+
+
+    <!-- ===== TOAST MESSAGE ===== -->
+    <div
+        id="toast"
+        class="toast"
+        role="status"
+        aria-live="polite"
+        hidden>
+    </div>
+
+
+    <!-- ===== JAVASCRIPT ===== -->
+    <script src="script.js"></script>
+
+</body>
+
+</html>
