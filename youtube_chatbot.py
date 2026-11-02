@@ -4,6 +4,9 @@ import re
 import cv2
 import tempfile
 import shutil
+import gc
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -39,25 +42,44 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INDEX_DIR = os.path.join(BASE_DIR, "faiss_indexes")
 os.makedirs(INDEX_DIR, exist_ok=True)
 
+# OCR sampling interval. Lower = more slide coverage, more processing.
 OCR_INTERVAL_SECONDS = int(os.getenv("OCR_INTERVAL_SECONDS", "30"))
 OCR_MAX_WIDTH = 1600
 
-VIDEO_CACHE = {}
+# Keep only one loaded video's vector store in process memory.
+# This is an in-memory cache only; FAISS indexes are also saved on disk.
+VIDEO_CACHE = OrderedDict()
+MAX_CACHED_VIDEOS = 1
 
+# Embedding model is loaded only when the first video is processed.
+# The exact same model and normalization setting are retained.
+_EMBEDDINGS = None
+_EMBEDDINGS_LOCK = threading.Lock()
+
+
+def get_embeddings():
+    global _EMBEDDINGS
+
+    if _EMBEDDINGS is None:
+        with _EMBEDDINGS_LOCK:
+            if _EMBEDDINGS is None:
+                print("Loading multilingual embedding model (lazy load)...")
+                _EMBEDDINGS = HuggingFaceEmbeddings(
+                    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                    model_kwargs={"device": "cpu"},
+                    encode_kwargs={"normalize_embeddings": True},
+                )
+                print("Embedding model loaded.")
+
+    return _EMBEDDINGS
+
+
+# If Tesseract is installed in the standard Windows location but is not
+# on PATH, this makes pytesseract find it.
 WINDOWS_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 if os.name == "nt" and os.path.exists(WINDOWS_TESSERACT):
     pytesseract.pytesseract.tesseract_cmd = WINDOWS_TESSERACT
-
-print("Loading multilingual embedding model...")
-
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-    model_kwargs={"device": "cpu"},
-    encode_kwargs={"normalize_embeddings": True},
-)
-
-print("Embedding model loaded.")
 
 print("Initializing Groq LLM...")
 
@@ -229,7 +251,8 @@ def extract_transcript(video_id: str, preferred_language=None) -> dict:
 def download_video_for_ocr(video_url: str, output_dir: str) -> str:
     """
     Downloads one progressive video stream for local frame OCR.
-    Prefers MP4 up to 360p to reduce download size.
+    It prefers MP4 up to 360p to reduce download size.
+    yt-dlp may need updating if YouTube changes its delivery.
     """
 
     options = {
@@ -264,6 +287,7 @@ def download_video_for_ocr(video_url: str, output_dir: str) -> str:
         if os.path.exists(candidate):
             return candidate
 
+    # Fallback: find the downloaded media file in the temporary directory.
     for path in Path(output_dir).iterdir():
 
         if path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
@@ -321,6 +345,7 @@ def preprocess_frame(frame):
 
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
+    # Otsu threshold often improves projected slide text.
     _, threshold = cv2.threshold(
         gray,
         0,
@@ -334,6 +359,7 @@ def preprocess_frame(frame):
 def extract_slide_text(video_path: str, interval_seconds=None) -> list:
     """
     Samples a frame every N seconds and extracts visible slide text.
+    Returns OCR records with video timestamps.
     """
 
     interval = interval_seconds or OCR_INTERVAL_SECONDS
@@ -394,6 +420,7 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
                     f"and language data. Details: {exc}"
                 )
 
+            # Normalize OCR output and remove empty/noisy frames.
             lines = [
                 re.sub(r"\s+", " ", line).strip()
                 for line in text.splitlines()
@@ -405,6 +432,7 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 
             normalized = re.sub(r"\W+", "", cleaned.lower())
 
+            # Avoid indexing identical consecutive slide frames.
             if (
                 cleaned
                 and len(normalized) >= 8
@@ -419,6 +447,10 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 
                 previous_normalized = normalized
 
+            # Release large frame arrays before decoding the next frame.
+            del processed
+            del frame
+
         second += interval
 
     capture.release()
@@ -431,7 +463,7 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 def extract_video_frames_ocr(video_url: str) -> list:
     """
     Uses a temporary directory. The downloaded video is deleted afterwards.
-    OCR failure is non-fatal.
+    OCR failure is non-fatal: transcript RAG can still work.
     """
 
     temp_dir = tempfile.mkdtemp(prefix="yt_chatbot_ocr_")
@@ -445,6 +477,7 @@ def extract_video_frames_ocr(video_url: str) -> list:
     finally:
 
         shutil.rmtree(temp_dir, ignore_errors=True)
+        gc.collect()
 
 
 # =========================================================
@@ -464,6 +497,7 @@ def create_hybrid_vector_store(
         language_code or "unknown"
     )
 
+    # Versioned folder prevents loading old transcript-only indexes.
     index_folder = os.path.join(
         INDEX_DIR,
         f"{video_id}_{safe_language}_hybrid_ocr_v1"
@@ -478,12 +512,13 @@ def create_hybrid_vector_store(
 
         return FAISS.load_local(
             index_folder,
-            embeddings,
+            get_embeddings(),
             allow_dangerous_deserialization=True,
         )
 
     documents = []
 
+    # Transcript documents grouped into approximately 30-second chunks.
     chunk = []
     chunk_start = None
     chunk_end = None
@@ -548,6 +583,7 @@ def create_hybrid_vector_store(
 
     save_transcript_chunk()
 
+    # OCR documents: one document per distinct slide/frame.
     for item in ocr_segments:
 
         text = str(item.get("text", "")).strip()
@@ -588,14 +624,14 @@ def create_hybrid_vector_store(
 
     vector_store = FAISS.from_documents(
         documents=documents,
-        embedding=embeddings,
+        embedding=get_embeddings(),
     )
 
     os.makedirs(index_folder, exist_ok=True)
 
     vector_store.save_local(index_folder)
 
-    print("Hybrid FAISS index saved successfully.")
+    print("Hybrid RAG FAISS index saved successfully.")
 
     return vector_store
 
@@ -610,12 +646,15 @@ def load_video(video_url: str) -> dict:
 
     if video_id in VIDEO_CACHE:
         print("Video found in memory cache.")
+        VIDEO_CACHE.move_to_end(video_id)
         return VIDEO_CACHE[video_id]
 
     print("Fetching YouTube video information...")
 
     video_info = get_video_info(video_id)
 
+    # Transcript is attempted first, but OCR can still work when captions
+    # are unavailable.
     transcript_data = {
         "language": "Unavailable",
         "language_code": "unknown",
@@ -641,6 +680,8 @@ def load_video(video_url: str) -> dict:
 
         print(f"Transcript extraction unavailable: {exc}")
 
+    # OCR is optional and non-fatal. If yt-dlp/Tesseract is not installed,
+    # the chatbot continues with transcript-only RAG.
     ocr_segments = []
     ocr_error = None
 
@@ -675,6 +716,14 @@ def load_video(video_url: str) -> dict:
     }
 
     VIDEO_CACHE[video_id] = video_data
+    VIDEO_CACHE.move_to_end(video_id)
+
+    # Avoid retaining multiple large FAISS stores in a 512 MB instance.
+    while len(VIDEO_CACHE) > MAX_CACHED_VIDEOS:
+        old_video_id, old_video_data = VIDEO_CACHE.popitem(last=False)
+        del old_video_data
+        print(f"Removed old video {old_video_id} from memory cache.")
+        gc.collect()
 
     print("Video loaded successfully with Hybrid RAG.")
 
@@ -709,6 +758,7 @@ def ask_question(video_id: str, question: str, language="English") -> str:
 
     vector_store = VIDEO_CACHE[video_id]["vector_store"]
 
+    # Retrieve from one combined index containing transcript + OCR.
     relevant_docs = vector_store.similarity_search(
         question.strip(),
         k=10,
@@ -790,193 +840,148 @@ Give a useful, accurate answer.
 
 def generate_summary(video_id: str, language="English") -> str:
     """
-    Generate a point-wise summary from the complete available
-    transcript and slide OCR content.
-
-    Long videos are processed in chunks so that the beginning,
-    middle and ending are all considered.
+    Generate a structured, point-wise summary from the complete available
+    transcript and slide OCR. Long videos are summarized in chunks so that
+    the middle of the video is not silently discarded.
     """
-
     language = validate_language(language)
 
     if video_id not in VIDEO_CACHE:
         raise ValueError("Video is not loaded. Please load it first.")
 
     video_data = VIDEO_CACHE[video_id]
-
     transcript_segments = video_data.get("segments", [])
     ocr_segments = video_data.get("ocr_segments", [])
 
-    # Combine transcript and OCR in chronological order.
+    # Merge transcript and OCR records in video-time order.
     timed_pieces = []
 
     for item in transcript_segments:
-
         text = str(item.get("text", "")).strip()
-
         if text:
             timed_pieces.append((
                 float(item.get("start", 0)),
-                f"[{item.get('timestamp', 'Unknown')}] "
-                f"[Transcript] {text}"
+                f"[{item.get('timestamp', 'Unknown')}] [Transcript] {text}"
             ))
 
     for item in ocr_segments:
-
         text = str(item.get("text", "")).strip()
-
         if text:
             timed_pieces.append((
                 float(item.get("start", 0)),
-                f"[{item.get('timestamp', 'Unknown')}] "
-                f"[Slide OCR] {text}"
+                f"[{item.get('timestamp', 'Unknown')}] [Slide OCR] {text}"
             ))
 
     timed_pieces.sort(key=lambda item: item[0])
+    combined = "\n".join(piece for _, piece in timed_pieces)
 
-    if not timed_pieces:
+    if not combined:
         raise ValueError(
             "No transcript or slide text is available to summarize."
         )
 
-    language_instruction = {
-        "English": "Write in natural, simple English.",
-        "Hindi": "Write in natural Hindi using Devanagari script.",
-        "Hinglish": "Write in simple Hindi-English mix using Roman script."
-    }
+    language_instruction = """
+    English: natural, simple English.
+    Hindi: natural Hindi in Devanagari.
+    Hinglish: simple Hindi-English mix in Roman script.
+    Keep technical terms in their original form where appropriate.
+    """
 
-    # Split content without cutting individual transcript/OCR records.
-    chunk_size = 9000
-    chunks = []
-    current_chunk = []
-    current_length = 0
+    # Chunking preserves coverage of long videos instead of selecting only
+    # the beginning, middle and ending portions.
+    chunk_size = 10000
+    chunks = [
+        combined[index:index + chunk_size]
+        for index in range(0, len(combined), chunk_size)
+    ]
 
-    for _, piece in timed_pieces:
+    if len(chunks) == 1:
+        source_content = chunks[0]
+    else:
+        chunk_prompt = ChatPromptTemplate.from_template("""
+You are extracting accurate study notes from one section of a YouTube video.
 
-        piece_length = len(piece)
+Write concise bullet-point notes in {language}.
+- Keep important concepts, definitions, examples, steps and components.
+- Preserve exact timestamps shown in the source.
+- Do not invent information or add facts from outside knowledge.
+- Do not write an introduction or conclusion.
+- Use headings and bullets, not tables.
+- This is only one section; do not imply it represents the whole video.
 
-        if current_chunk and current_length + piece_length > chunk_size:
-
-            chunks.append("\n".join(current_chunk))
-
-            current_chunk = []
-            current_length = 0
-
-        current_chunk.append(piece)
-        current_length += piece_length
-
-    if current_chunk:
-        chunks.append("\n".join(current_chunk))
-
-    # Summarize each section when the video is long.
-    if len(chunks) > 1:
-
-        section_prompt = ChatPromptTemplate.from_template("""
-You are creating study notes from one section of a YouTube video.
-
-Extract only the important information in concise bullet points.
-
-RULES:
-- Use short bullet points, not paragraphs.
-- Preserve definitions, explanations, examples, steps and components.
-- Preserve timestamps exactly as provided.
-- Do not invent facts or timestamps.
-- Combine transcript and slide OCR only when they support the same point.
-- OCR may contain errors; do not guess unclear text.
-- Do not add an introduction, conclusion, or table.
-- Keep the notes concise but retain the section's important information.
-- Write in this language: {language_instruction}
-
-VIDEO SECTION:
+SOURCE SECTION:
 {content}
-
-Return only the section notes.
 """)
-
-        section_chain = section_prompt | llm | StrOutputParser()
-
-        section_notes = []
+        chunk_chain = chunk_prompt | llm | StrOutputParser()
+        chunk_notes = []
 
         for index, chunk in enumerate(chunks, start=1):
-
-            print(
-                f"Generating summary notes for section "
-                f"{index}/{len(chunks)}..."
-            )
-
-            notes = section_chain.invoke({
+            notes = chunk_chain.invoke({
                 "content": chunk,
-                "language_instruction": language_instruction[language]
+                "language": language,
             })
-
-            section_notes.append(
-                f"SECTION {index} NOTES:\n{notes.strip()}"
+            chunk_notes.append(
+                f"VIDEO SECTION {index} NOTES:\n{notes}"
             )
 
-        source_content = "\n\n".join(section_notes)
+        source_content = "\n\n".join(chunk_notes)
 
-    else:
-        source_content = chunks[0]
-
-    # Final point-wise summary.
     final_prompt = ChatPromptTemplate.from_template("""
 You are a professional YouTube video summarizer and study-notes creator.
 
-Create an accurate, useful and POINT-WISE summary of the supplied video
-content in the selected language.
+Create a concise, well-organized, POINT-WISE summary in {language}.
 
 STRICT FORMATTING RULES:
-- Use Markdown headings, bullet points and numbered lists.
-- Do not use Markdown tables.
-- Do not write long paragraphs.
-- Keep each bullet concise and informative.
-- Use **bold** for important technical terms.
+- Return Markdown headings, numbered lists and bullet points.
+- Never use tables.
+- Never write long paragraphs.
+- Use short, clear, useful points.
 - Do not output HTML tags such as <br>.
-- Do not escape Markdown characters with backslashes.
+- Use **bold** only for important terms; do not escape Markdown characters.
+- Use numbered lists for processes, steps, characteristics and components.
+- Include timestamps only when exact timestamps appear in the supplied source.
+- Do not invent timestamps, names, definitions, examples, facts or components.
 - Do not repeat the same information in multiple sections.
-- Do not invent facts, names, definitions, examples or timestamps.
-- Use only the supplied content as evidence.
-- Preserve exact timestamps only when they appear in the supplied content.
-- Treat OCR text cautiously; do not guess unclear words.
-- If a detail is not available, leave it out rather than making it up.
+- Combine transcript and slide OCR evidence where relevant.
+- Treat unclear OCR cautiously.
+- Summarize only what the supplied source supports.
 
 FOLLOW THIS OUTPUT STRUCTURE:
 
 ## 1. Video Overview
-- Give 2-4 short bullet points describing the video.
+- Give 2-4 short bullet points.
 
 ## 2. Main Topics Covered
-- List the important topics in the order they appear.
-- Give each topic its own ### heading.
-- Add 1-3 short bullet points under each topic.
-- Put an exact timestamp in the topic heading only when available.
+- List important topics in the order they appear.
+- Use a short bold topic heading.
+- Add 1-3 concise bullet points under each topic.
+- Include an exact timestamp in the topic heading only when available.
 
 ## 3. Key Learning Points
-1. List the most important learning point.
-2. List the next important learning point.
-3. Continue as needed, without repeating topics.
+- Give the main concepts as numbered or bulleted points.
+- Explain each point briefly.
 
 ## 4. Important Terms / Components
-- List only terms and components actually supported by the content.
-- Explain each briefly when the source provides an explanation.
+- List important terms, components or names mentioned.
+- Explain them briefly only when the source supports the explanation.
 
 ## 5. Conclusion
-- Give 2-3 short bullet points with the main takeaways.
+- Give 2-3 short bullet points.
 
 LANGUAGE:
 {language_instruction}
 
-VIDEO CONTENT:
-{content}
+Selected response language: {language}
 
-Return only the final summary in the required structure.
+COMPLETE VIDEO NOTES / SOURCE:
+{content}
 """)
 
     final_chain = final_prompt | llm | StrOutputParser()
-
     summary = final_chain.invoke({
         "content": source_content,
-        "language_instruction": language_instruction[language]
+        "language": language,
+        "language_instruction": language_instruction,
     })
 
     return summary.strip()
