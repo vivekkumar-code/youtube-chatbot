@@ -14,7 +14,7 @@
 
 <body>
 
-    <!-- ===== HEADER ===== -->
+    <!-- HEADER -->
     <header class="header">
 
         <div class="brand">
@@ -59,13 +59,13 @@
     </header>
 
 
-    <!-- ===== MAIN CONTENT ===== -->
+    <!-- MAIN CONTENT -->
     <main class="container">
 
-        <!-- ===== HOME SECTION ===== -->
+        <!-- HOME SECTION -->
         <section id="view-home" class="view active">
 
-            <!-- Video URL Form -->
+            <!-- VIDEO URL FORM -->
             <form id="videoForm" class="card load-card" novalidate>
 
                 <label for="urlInput">
@@ -109,7 +109,43 @@
             </form>
 
 
-            <!-- Empty State -->
+            <!-- MANUAL TRANSCRIPT FALLBACK -->
+            <div id="manualTranscriptBox" class="card" hidden>
+
+                <h3>Manual Transcript</h3>
+
+                <p class="muted">
+                    Automatic transcript extraction was unsuccessful.
+                    You can copy the transcript from YouTube and paste it below.
+                </p>
+
+                <form id="manualTranscriptForm">
+
+                    <label for="manualTranscriptInput">
+                        Paste your video transcript
+                    </label>
+
+                    <textarea
+                        id="manualTranscriptInput"
+                        rows="8"
+                        placeholder="Paste your YouTube transcript here..."
+                        minlength="20"
+                        required
+                    ></textarea>
+
+                    <button
+                        id="manualTranscriptBtn"
+                        class="btn primary"
+                        type="submit">
+                        Process Transcript
+                    </button>
+
+                </form>
+
+            </div>
+
+
+            <!-- EMPTY STATE -->
             <div id="empty" class="card empty">
 
                 <h2>Paste a link to start learning</h2>
@@ -122,13 +158,13 @@
             </div>
 
 
-            <!-- ===== VIDEO WORKSPACE ===== -->
+            <!-- VIDEO WORKSPACE -->
             <div id="workspace" class="workspace" hidden>
 
-                <!-- Main Column -->
+                <!-- MAIN COLUMN -->
                 <div class="col-main">
 
-                    <!-- Video Player -->
+                    <!-- VIDEO PLAYER -->
                     <article class="card video-card">
 
                         <div class="player-wrap">
@@ -158,7 +194,7 @@
                     </article>
 
 
-                    <!-- AI Summary -->
+                    <!-- AI SUMMARY -->
                     <article class="card">
 
                         <h3>AI Summary</h3>
@@ -201,7 +237,7 @@
                 </div>
 
 
-                <!-- ===== CHAT SECTION ===== -->
+                <!-- CHAT SECTION -->
                 <aside class="card chat">
 
                     <div class="card-head">
@@ -218,7 +254,7 @@
                     </div>
 
 
-                    <!-- Chat Messages -->
+                    <!-- CHAT MESSAGES -->
                     <div
                         id="chatMessages"
                         class="messages"
@@ -227,7 +263,7 @@
                     </div>
 
 
-                    <!-- Chat Input -->
+                    <!-- CHAT INPUT -->
                     <form id="chatForm" class="chat-form">
 
                         <textarea
@@ -254,7 +290,7 @@
         </section>
 
 
-        <!-- ===== HISTORY SECTION ===== -->
+        <!-- HISTORY SECTION -->
         <section id="view-history" class="view" hidden>
 
             <div class="card">
@@ -279,7 +315,7 @@
         </section>
 
 
-        <!-- ===== ABOUT SECTION ===== -->
+        <!-- ABOUT SECTION -->
         <section id="view-about" class="view" hidden>
 
             <div class="card about">
@@ -305,7 +341,7 @@
     </main>
 
 
-    <!-- ===== TOAST MESSAGE ===== -->
+    <!-- TOAST MESSAGE -->
     <div
         id="toast"
         class="toast"
@@ -315,7 +351,7 @@
     </div>
 
 
-    <!-- ===== JAVASCRIPT ===== -->
+    <!-- JAVASCRIPT -->
     <script src="script.js"></script>
 
 </body>
