@@ -13,14 +13,13 @@ import shutil
 import gc
 
 import threading
+import time
 
 from collections import OrderedDict
 
 from pathlib import Path
 
 from urllib.parse import urlparse, parse_qs
-
-
 
 import pytesseract
 
@@ -31,8 +30,6 @@ from yt_dlp import YoutubeDL
 from youtube_transcript_api import YouTubeTranscriptApi
 
 from googleapiclient.discovery import build
-
-
 
 from langchain_core.documents import Document
 
@@ -46,37 +43,23 @@ from langchain_community.vectorstores import FAISS
 
 from langchain_groq import ChatGroq
 
-
-
-
-
 # =========================================================
 
 # CONFIGURATION
 
 # =========================================================
 
-
-
 load_dotenv()
-
-
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
-
-
 if not GROQ_API_KEY:
 
     raise ValueError("GROQ_API_KEY missing in .env file.")
 
-
-
 SUPPORTED_LANGUAGES = ["English", "Hindi", "Hinglish"]
-
-
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -84,15 +67,11 @@ INDEX_DIR = os.path.join(BASE_DIR, "faiss_indexes")
 
 os.makedirs(INDEX_DIR, exist_ok=True)
 
-
-
 # OCR sampling interval. Lower = more slide coverage, more processing.
 
 OCR_INTERVAL_SECONDS = int(os.getenv("OCR_INTERVAL_SECONDS", "30"))
 
 OCR_MAX_WIDTH = 1600
-
-
 
 # Keep only one loaded video's vector store in process memory.
 
@@ -102,8 +81,6 @@ VIDEO_CACHE = OrderedDict()
 
 MAX_CACHED_VIDEOS = 1
 
-
-
 # Embedding model is loaded only when the first video is processed.
 
 # The exact same model and normalization setting are retained.
@@ -112,15 +89,9 @@ _EMBEDDINGS = None
 
 _EMBEDDINGS_LOCK = threading.Lock()
 
-
-
-
-
 def get_embeddings():
 
     global _EMBEDDINGS
-
-
 
     if _EMBEDDINGS is None:
 
@@ -142,13 +113,7 @@ def get_embeddings():
 
                 print("Embedding model loaded.")
 
-
-
     return _EMBEDDINGS
-
-
-
-
 
 # If Tesseract is installed in the standard Windows location but is not
 
@@ -156,17 +121,11 @@ def get_embeddings():
 
 WINDOWS_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-
-
 if os.name == "nt" and os.path.exists(WINDOWS_TESSERACT):
 
     pytesseract.pytesseract.tesseract_cmd = WINDOWS_TESSERACT
 
-
-
 print("Initializing Groq LLM...")
-
-
 
 llm = ChatGroq(
 
@@ -180,12 +139,42 @@ llm = ChatGroq(
 
 )
 
-
-
 print("Groq LLM initialized.")
 
+# Dedicated, lower-output-token configuration for video summaries.
+# It uses the same Groq model/API key, so it shares the account TPM quota.
+summary_llm = ChatGroq(
+    model="openai/gpt-oss-20b",
+    temperature=0,
+    max_tokens=1000,
+    api_key=GROQ_API_KEY,
+)
 
 
+def invoke_summary_with_retry(chain, payload, max_retries=2):
+    """Retry summary calls after transient Groq rate-limit/network errors."""
+    for attempt in range(max_retries + 1):
+        try:
+            return chain.invoke(payload)
+        except Exception as exc:
+            message = str(exc).lower()
+            is_rate_limit = "429" in message or "rate_limit" in message or "rate limit" in message
+            is_connection_error = (
+                "apiconnectionerror" in message
+                or "connection error" in message
+                or "connection reset" in message
+            )
+
+            if attempt >= max_retries or not (is_rate_limit or is_connection_error):
+                raise
+
+            # Groq's TPM window is per minute. Wait a full window on 429.
+            wait_seconds = 65 if is_rate_limit else 5 * (attempt + 1)
+            print(
+                f"Summary request temporarily failed ({type(exc).__name__}). "
+                f"Retrying in {wait_seconds}s..."
+            )
+            time.sleep(wait_seconds)
 
 
 # =========================================================
@@ -194,11 +183,7 @@ print("Groq LLM initialized.")
 
 # =========================================================
 
-
-
 def extract_video_id(url: str) -> str:
-
-
 
     parsed = urlparse(str(url).strip())
 
@@ -206,55 +191,33 @@ def extract_video_id(url: str) -> str:
 
     video_id = None
 
-
-
     if host == "youtu.be":
 
         video_id = parsed.path.strip("/").split("/")[0]
 
-
-
     elif host in ("youtube.com", "www.youtube.com", "m.youtube.com"):
-
-
 
         if parsed.path == "/watch":
 
             video_id = parse_qs(parsed.query).get("v", [None])[0]
 
-
-
         elif parsed.path.startswith(("/shorts/", "/embed/", "/live/")):
 
             parts = parsed.path.strip("/").split("/")
-
-
 
             if len(parts) > 1:
 
                 video_id = parts[1]
 
-
-
     if not video_id or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
 
         raise ValueError("Invalid YouTube URL.")
 
-
-
     return video_id
-
-
-
-
 
 def format_timestamp(seconds) -> str:
 
-
-
     seconds = max(0, int(float(seconds or 0)))
-
-
 
     hours = seconds // 3600
 
@@ -262,27 +225,15 @@ def format_timestamp(seconds) -> str:
 
     secs = seconds % 60
 
-
-
     if hours:
 
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
-
-
     return f"{minutes:02d}:{secs:02d}"
-
-
-
-
 
 def get_video_info(video_id: str) -> dict:
 
-
-
     thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
-
-
 
     if not YOUTUBE_API_KEY:
 
@@ -304,8 +255,6 @@ def get_video_info(video_id: str) -> dict:
 
         }
 
-
-
     youtube = build(
 
         "youtube",
@@ -318,8 +267,6 @@ def get_video_info(video_id: str) -> dict:
 
     )
 
-
-
     response = youtube.videos().list(
 
         part="snippet,contentDetails",
@@ -328,23 +275,15 @@ def get_video_info(video_id: str) -> dict:
 
     ).execute()
 
-
-
     items = response.get("items", [])
-
-
 
     if not items:
 
         raise ValueError("Video not found or unavailable.")
 
-
-
     video = items[0]
 
     snippet = video["snippet"]
-
-
 
     return {
 
@@ -374,45 +313,27 @@ def get_video_info(video_id: str) -> dict:
 
     }
 
-
-
-
-
 # =========================================================
 
 # TRANSCRIPT EXTRACTION
 
 # =========================================================
 
-
-
 def extract_transcript(video_id: str, preferred_language=None) -> dict:
-
-
 
     api = YouTubeTranscriptApi()
 
     transcript_list = list(api.list(video_id))
 
-
-
     if not transcript_list:
 
         raise ValueError("No captions available for this video.")
 
-
-
     selected = None
-
-
 
     if preferred_language:
 
-
-
         base = preferred_language.lower().split("-")[0]
-
-
 
         matching = [
 
@@ -422,15 +343,11 @@ def extract_transcript(video_id: str, preferred_language=None) -> dict:
 
         ]
 
-
-
         if matching:
 
             manual = [item for item in matching if not item.is_generated]
 
             selected = manual[0] if manual else matching[0]
-
-
 
     if selected is None:
 
@@ -438,21 +355,13 @@ def extract_transcript(video_id: str, preferred_language=None) -> dict:
 
         selected = manual[0] if manual else transcript_list[0]
 
-
-
     fetched = selected.fetch()
 
     segments = []
 
-
-
     for item in fetched:
 
-
-
         text = item.text.strip()
-
-
 
         if text:
 
@@ -466,13 +375,9 @@ def extract_transcript(video_id: str, preferred_language=None) -> dict:
 
             })
 
-
-
     if not segments:
 
         raise ValueError("Transcript is empty.")
-
-
 
     return {
 
@@ -486,17 +391,11 @@ def extract_transcript(video_id: str, preferred_language=None) -> dict:
 
     }
 
-
-
-
-
 # =========================================================
 
 # LOCAL VIDEO DOWNLOAD + OCR
 
 # =========================================================
-
-
 
 def download_video_for_ocr(video_url: str, output_dir: str) -> str:
 
@@ -509,8 +408,6 @@ def download_video_for_ocr(video_url: str, output_dir: str) -> str:
     yt-dlp may need updating if YouTube changes its delivery.
 
     """
-
-
 
     options = {
 
@@ -540,53 +437,33 @@ def download_video_for_ocr(video_url: str, output_dir: str) -> str:
 
     }
 
-
-
     with YoutubeDL(options) as ydl:
-
-
 
         info = ydl.extract_info(video_url, download=True)
 
-
-
         requested = info.get("requested_downloads") or []
-
-
 
         if requested and requested[0].get("filepath"):
 
             candidate = requested[0]["filepath"]
 
-
-
             if os.path.exists(candidate):
 
                 return candidate
 
-
-
         candidate = ydl.prepare_filename(info)
-
-
 
         if os.path.exists(candidate):
 
             return candidate
 
-
-
     # Fallback: find the downloaded media file in the temporary directory.
 
     for path in Path(output_dir).iterdir():
 
-
-
         if path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
 
             return str(path)
-
-
 
     raise RuntimeError(
 
@@ -594,67 +471,37 @@ def download_video_for_ocr(video_url: str, output_dir: str) -> str:
 
     )
 
-
-
-
-
 def _available_ocr_languages():
-
-
 
     try:
 
-
-
         langs = set(pytesseract.get_languages(config=""))
-
-
 
         if "eng" in langs and "hin" in langs:
 
             return "eng+hin"
 
-
-
         if "eng" in langs:
 
             return "eng"
-
-
 
         if "hin" in langs:
 
             return "hin"
 
-
-
         return "eng"
-
-
 
     except Exception:
 
         return "eng"
 
-
-
-
-
 def preprocess_frame(frame):
-
-
 
     height, width = frame.shape[:2]
 
-
-
     if width > OCR_MAX_WIDTH:
 
-
-
         scale = OCR_MAX_WIDTH / width
-
-
 
         frame = cv2.resize(
 
@@ -666,11 +513,7 @@ def preprocess_frame(frame):
 
         )
 
-
-
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-
 
     gray = cv2.resize(
 
@@ -686,11 +529,7 @@ def preprocess_frame(frame):
 
     )
 
-
-
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
-
 
     # Otsu threshold often improves projected slide text.
 
@@ -706,13 +545,7 @@ def preprocess_frame(frame):
 
     )
 
-
-
     return threshold
-
-
-
-
 
 def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 
@@ -724,37 +557,23 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 
     """
 
-
-
     interval = interval_seconds or OCR_INTERVAL_SECONDS
-
-
 
     if interval < 5:
 
         interval = 5
 
-
-
     capture = cv2.VideoCapture(video_path)
-
-
 
     if not capture.isOpened():
 
         raise RuntimeError("OpenCV could not open the downloaded video.")
 
-
-
     fps = capture.get(cv2.CAP_PROP_FPS) or 0
 
     frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0
 
-
-
     duration = frame_count / fps if fps > 0 else 0
-
-
 
     if duration <= 0:
 
@@ -762,17 +581,11 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 
         raise RuntimeError("Could not determine video duration for OCR.")
 
-
-
     ocr_lang = _available_ocr_languages()
-
-
 
     records = []
 
     previous_normalized = ""
-
-
 
     print(
 
@@ -782,35 +595,19 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 
     )
 
-
-
     second = 0.0
-
-
 
     while second < duration:
 
-
-
         capture.set(cv2.CAP_PROP_POS_MSEC, second * 1000)
-
-
 
         ok, frame = capture.read()
 
-
-
         if ok and frame is not None:
-
-
 
             processed = preprocess_frame(frame)
 
-
-
             try:
-
-
 
                 text = pytesseract.image_to_string(
 
@@ -822,15 +619,9 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 
                 )
 
-
-
             except Exception as exc:
 
-
-
                 capture.release()
-
-
 
                 raise RuntimeError(
 
@@ -839,8 +630,6 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
                     f"and language data. Details: {exc}"
 
                 )
-
-
 
             # Normalize OCR output and remove empty/noisy frames.
 
@@ -852,19 +641,13 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 
             ]
 
-
-
             cleaned = "\n".join(
 
                 line for line in lines if len(line) >= 2
 
             )
 
-
-
             normalized = re.sub(r"\W+", "", cleaned.lower())
-
-
 
             # Avoid indexing identical consecutive slide frames.
 
@@ -878,8 +661,6 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 
             ):
 
-
-
                 records.append({
 
                     "timestamp": format_timestamp(second),
@@ -890,11 +671,7 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 
                 })
 
-
-
                 previous_normalized = normalized
-
-
 
             # Release large frame arrays before decoding the next frame.
 
@@ -902,25 +679,13 @@ def extract_slide_text(video_path: str, interval_seconds=None) -> list:
 
             del frame
 
-
-
         second += interval
-
-
 
     capture.release()
 
-
-
     print(f"OCR extracted text from {len(records)} distinct frames.")
 
-
-
     return records
-
-
-
-
 
 def extract_video_frames_ocr(video_url: str) -> list:
 
@@ -932,43 +697,25 @@ def extract_video_frames_ocr(video_url: str) -> list:
 
     """
 
-
-
     temp_dir = tempfile.mkdtemp(prefix="yt_chatbot_ocr_")
-
-
 
     try:
 
-
-
         video_path = download_video_for_ocr(video_url, temp_dir)
-
-
 
         return extract_slide_text(video_path)
 
-
-
     finally:
-
-
 
         shutil.rmtree(temp_dir, ignore_errors=True)
 
         gc.collect()
-
-
-
-
 
 # =========================================================
 
 # HYBRID FAISS INDEX: TRANSCRIPT + SLIDE OCR
 
 # =========================================================
-
-
 
 def create_hybrid_vector_store(
 
@@ -982,8 +729,6 @@ def create_hybrid_vector_store(
 
 ):
 
-
-
     safe_language = re.sub(
 
         r"[^a-zA-Z0-9_-]",
@@ -993,8 +738,6 @@ def create_hybrid_vector_store(
         language_code or "unknown"
 
     )
-
-
 
     # Versioned folder prevents loading old transcript-only indexes.
 
@@ -1006,21 +749,13 @@ def create_hybrid_vector_store(
 
     )
 
-
-
     index_file = os.path.join(index_folder, "index.faiss")
 
     metadata_file = os.path.join(index_folder, "index.pkl")
 
-
-
     if os.path.isfile(index_file) and os.path.isfile(metadata_file):
 
-
-
         print("Loading existing Hybrid RAG FAISS index...")
-
-
 
         return FAISS.load_local(
 
@@ -1032,11 +767,7 @@ def create_hybrid_vector_store(
 
         )
 
-
-
     documents = []
-
-
 
     # Transcript documents grouped into approximately 30-second chunks.
 
@@ -1048,35 +779,23 @@ def create_hybrid_vector_store(
 
     chunk_chars = 0
 
-
-
     def save_transcript_chunk():
 
-
-
         nonlocal chunk, chunk_start, chunk_end, chunk_chars
-
-
 
         if not chunk:
 
             return
 
-
-
         start_label = format_timestamp(chunk_start)
 
         end_label = format_timestamp(chunk_end)
-
-
 
         body = "\n".join(
 
             f"[{item['timestamp']}] {item['text']}" for item in chunk
 
         )
-
-
 
         documents.append(Document(
 
@@ -1106,8 +825,6 @@ def create_hybrid_vector_store(
 
         ))
 
-
-
         chunk = []
 
         chunk_start = None
@@ -1116,25 +833,15 @@ def create_hybrid_vector_store(
 
         chunk_chars = 0
 
-
-
     for item in transcript_segments:
 
-
-
         text = str(item.get("text", "")).strip()
-
-
 
         if not text:
 
             continue
 
-
-
         current = float(item.get("start", 0))
-
-
 
         if chunk and (
 
@@ -1144,17 +851,11 @@ def create_hybrid_vector_store(
 
         ):
 
-
-
             save_transcript_chunk()
-
-
 
         if chunk_start is None:
 
             chunk_start = current
-
-
 
         chunk_end = current
 
@@ -1162,33 +863,21 @@ def create_hybrid_vector_store(
 
         chunk_chars += len(text)
 
-
-
     save_transcript_chunk()
-
-
 
     # OCR documents: one document per distinct slide/frame.
 
     for item in ocr_segments:
 
-
-
         text = str(item.get("text", "")).strip()
-
-
 
         if not text:
 
             continue
 
-
-
         timestamp = item.get("timestamp", "Unknown")
 
         start = float(item.get("start", 0))
-
-
 
         documents.append(Document(
 
@@ -1222,8 +911,6 @@ def create_hybrid_vector_store(
 
         ))
 
-
-
     if not documents:
 
         raise ValueError(
@@ -1231,8 +918,6 @@ def create_hybrid_vector_store(
             "No searchable content was extracted from transcript or video frames."
 
         )
-
-
 
     print(
 
@@ -1244,8 +929,6 @@ def create_hybrid_vector_store(
 
     )
 
-
-
     vector_store = FAISS.from_documents(
 
         documents=documents,
@@ -1254,25 +937,13 @@ def create_hybrid_vector_store(
 
     )
 
-
-
     os.makedirs(index_folder, exist_ok=True)
-
-
 
     vector_store.save_local(index_folder)
 
-
-
     print("Hybrid RAG FAISS index saved successfully.")
 
-
-
     return vector_store
-
-
-
-
 
 # =========================================================
 
@@ -1280,15 +951,9 @@ def create_hybrid_vector_store(
 
 # =========================================================
 
-
-
 def load_video(video_url: str) -> dict:
 
-
-
     video_id = extract_video_id(video_url)
-
-
 
     if video_id in VIDEO_CACHE:
 
@@ -1298,15 +963,9 @@ def load_video(video_url: str) -> dict:
 
         return VIDEO_CACHE[video_id]
 
-
-
     print("Fetching YouTube video information...")
 
-
-
     video_info = get_video_info(video_id)
-
-
 
     # Transcript is attempted first, but OCR can still work when captions
 
@@ -1324,15 +983,9 @@ def load_video(video_url: str) -> dict:
 
     }
 
-
-
     try:
 
-
-
         print("Extracting YouTube transcript...")
-
-
 
         transcript_data = extract_transcript(
 
@@ -1342,8 +995,6 @@ def load_video(video_url: str) -> dict:
 
         )
 
-
-
         print(
 
             f"Transcript extracted: {len(transcript_data['segments'])} "
@@ -1352,15 +1003,9 @@ def load_video(video_url: str) -> dict:
 
         )
 
-
-
     except Exception as exc:
 
-
-
         print(f"Transcript extraction unavailable: {exc}")
-
-
 
     # OCR is optional and non-fatal. If yt-dlp/Tesseract is not installed,
 
@@ -1370,31 +1015,17 @@ def load_video(video_url: str) -> dict:
 
     ocr_error = None
 
-
-
     try:
-
-
 
         print("Downloading video temporarily for local slide OCR...")
 
-
-
         ocr_segments = extract_video_frames_ocr(video_url)
-
-
 
     except Exception as exc:
 
-
-
         ocr_error = str(exc)
 
-
-
         print("Local OCR skipped/failed:", ocr_error)
-
-
 
     vector_store = create_hybrid_vector_store(
 
@@ -1407,8 +1038,6 @@ def load_video(video_url: str) -> dict:
         language_code=transcript_data["language_code"],
 
     )
-
-
 
     video_data = {
 
@@ -1430,13 +1059,9 @@ def load_video(video_url: str) -> dict:
 
     }
 
-
-
     VIDEO_CACHE[video_id] = video_data
 
     VIDEO_CACHE.move_to_end(video_id)
-
-
 
     # Avoid retaining multiple large FAISS stores in a 512 MB instance.
 
@@ -1450,17 +1075,9 @@ def load_video(video_url: str) -> dict:
 
         gc.collect()
 
-
-
     print("Video loaded successfully with Hybrid RAG.")
 
-
-
     return video_data
-
-
-
-
 
 # =========================================================
 
@@ -1468,23 +1085,13 @@ def load_video(video_url: str) -> dict:
 
 # =========================================================
 
-
-
 def validate_language(language: str) -> str:
-
-
 
     if language not in SUPPORTED_LANGUAGES:
 
         raise ValueError("Choose English, Hindi or Hinglish.")
 
-
-
     return language
-
-
-
-
 
 # =========================================================
 
@@ -1492,31 +1099,19 @@ def validate_language(language: str) -> str:
 
 # =========================================================
 
-
-
 def ask_question(video_id: str, question: str, language="English") -> str:
 
-
-
     language = validate_language(language)
-
-
 
     if not question or not question.strip():
 
         raise ValueError("Question cannot be empty.")
 
-
-
     if video_id not in VIDEO_CACHE:
 
         raise ValueError("Video is not loaded. Please load it again.")
 
-
-
     vector_store = VIDEO_CACHE[video_id]["vector_store"]
-
-
 
     # Retrieve from one combined index containing transcript + OCR.
 
@@ -1528,29 +1123,19 @@ def ask_question(video_id: str, question: str, language="English") -> str:
 
     )
 
-
-
     if not relevant_docs:
 
         raise ValueError("No relevant video content found.")
 
-
-
     context_parts = []
 
-
-
     for doc in relevant_docs:
-
-
 
         source = doc.metadata.get("source", "video")
 
         timestamp = doc.metadata.get("timestamp", "Unknown")
 
         end_timestamp = doc.metadata.get("end_timestamp", timestamp)
-
-
 
         source_label = (
 
@@ -1560,8 +1145,6 @@ def ask_question(video_id: str, question: str, language="English") -> str:
 
         )
 
-
-
         context_parts.append(
 
             f"[Source: {source_label} | Video time: {timestamp} - {end_timestamp}]\n"
@@ -1570,53 +1153,43 @@ def ask_question(video_id: str, question: str, language="English") -> str:
 
         )
 
-
-
     context = "\n\n---\n\n".join(context_parts)
-
-
 
     prompt = ChatPromptTemplate.from_template("""
 
 You are an accurate YouTube video tutor using Hybrid RAG.
 
-
-
 The retrieved context can contain:
 
-1\. Spoken video transcript.
+1\\. Spoken video transcript.
 
-2\. Text read from presentation slides or other video frames using OCR.
-
-
+2\\. Text read from presentation slides or other video frames using OCR.
 
 RULES:
 
-\- Answer the user's actual question directly.
+\\- Answer the user's actual question directly.
 
-\- Use only the supplied context as evidence about this video.
+\\- Use only the supplied context as evidence about this video.
 
-\- Combine transcript and OCR evidence when both are relevant.
+\\- Combine transcript and OCR evidence when both are relevant.
 
-\- OCR may contain recognition mistakes. If text is unclear, say so.
+\\- OCR may contain recognition mistakes. If text is unclear, say so.
 
-\- Do not invent facts, definitions, examples, or timestamps.
+\\- Do not invent facts, definitions, examples, or timestamps.
 
-\- A topic heading alone is not enough to claim its full definition.
+\\- A topic heading alone is not enough to claim its full definition.
 
-\- If the context does not contain the requested information, clearly say
+\\- If the context does not contain the requested information, clearly say
 
   that the available transcript/slide text does not provide it.
 
-\- Mention whether evidence came from spoken transcript or slide text
+\\- Mention whether evidence came from spoken transcript or slide text
 
   when useful.
 
-\- Include timestamps only when present in the retrieved context.
+\\- Include timestamps only when present in the retrieved context.
 
-\- Use simple, clear language.
-
-
+\\- Use simple, clear language.
 
 RESPONSE LANGUAGE:
 
@@ -1628,33 +1201,21 @@ Hinglish: Hindi-English mix in Roman script.
 
 Keep technical terms in their original form where appropriate.
 
-
-
 Selected response language: {language}
-
-
 
 RETRIEVED VIDEO CONTEXT:
 
 {context}
 
-
-
 USER QUESTION:
 
 {question}
-
-
 
 Give a useful, accurate answer.
 
 """)
 
-
-
     chain = prompt | llm | StrOutputParser()
-
-
 
     return chain.invoke({
 
@@ -1666,17 +1227,11 @@ Give a useful, accurate answer.
 
     })
 
-
-
-
-
 # =========================================================
 
 # SUMMARY
 
 # =========================================================
-
-
 
 def generate_summary(video_id: str, language="English") -> str:
 
@@ -1692,13 +1247,9 @@ def generate_summary(video_id: str, language="English") -> str:
 
     language = validate_language(language)
 
-
-
     if video_id not in VIDEO_CACHE:
 
         raise ValueError("Video is not loaded. Please load it first.")
-
-
 
     video_data = VIDEO_CACHE[video_id]
 
@@ -1706,13 +1257,9 @@ def generate_summary(video_id: str, language="English") -> str:
 
     ocr_segments = video_data.get("ocr_segments", [])
 
-
-
     # Merge transcript and OCR records in video-time order.
 
     timed_pieces = []
-
-
 
     for item in transcript_segments:
 
@@ -1728,8 +1275,6 @@ def generate_summary(video_id: str, language="English") -> str:
 
             ))
 
-
-
     for item in ocr_segments:
 
         text = str(item.get("text", "")).strip()
@@ -1744,13 +1289,9 @@ def generate_summary(video_id: str, language="English") -> str:
 
             ))
 
-
-
     timed_pieces.sort(key=lambda item: item[0])
 
     combined = "\n".join(piece for _, piece in timed_pieces)
-
-
 
     if not combined:
 
@@ -1759,8 +1300,6 @@ def generate_summary(video_id: str, language="English") -> str:
             "No transcript or slide text is available to summarize."
 
         )
-
-
 
     language_instruction = """
 
@@ -1774,13 +1313,11 @@ def generate_summary(video_id: str, language="English") -> str:
 
     """
 
-
-
     # Chunking preserves coverage of long videos instead of selecting only
 
     # the beginning, middle and ending portions.
 
-    chunk_size = 10000
+    chunk_size = 4000
 
     chunks = [
 
@@ -1789,8 +1326,6 @@ def generate_summary(video_id: str, language="English") -> str:
         for index in range(0, len(combined), chunk_size)
 
     ]
-
-
 
     if len(chunks) == 1:
 
@@ -1802,23 +1337,19 @@ def generate_summary(video_id: str, language="English") -> str:
 
 You are extracting accurate study notes from one section of a YouTube video.
 
-
-
 Write concise bullet-point notes in {language}.
 
-\- Keep important concepts, definitions, examples, steps and components.
+\\- Keep important concepts, definitions, examples, steps and components.
 
-\- Preserve exact timestamps shown in the source.
+\\- Preserve exact timestamps shown in the source.
 
-\- Do not invent information or add facts from outside knowledge.
+\\- Do not invent information or add facts from outside knowledge.
 
-\- Do not write an introduction or conclusion.
+\\- Do not write an introduction or conclusion.
 
-\- Use headings and bullets, not tables.
+\\- Use headings and bullets, not tables.
 
-\- This is only one section; do not imply it represents the whole video.
-
-
+\\- This is only one section; do not imply it represents the whole video.
 
 SOURCE SECTION:
 
@@ -1826,15 +1357,13 @@ SOURCE SECTION:
 
 """)
 
-        chunk_chain = chunk_prompt | llm | StrOutputParser()
+        chunk_chain = chunk_prompt | summary_llm | StrOutputParser()
 
         chunk_notes = []
 
-
-
         for index, chunk in enumerate(chunks, start=1):
 
-            notes = chunk_chain.invoke({
+            notes = invoke_summary_with_retry(chunk_chain, {
 
                 "content": chunk,
 
@@ -1848,105 +1377,79 @@ SOURCE SECTION:
 
             )
 
-
-
         source_content = "\n\n".join(chunk_notes)
-
-
 
     final_prompt = ChatPromptTemplate.from_template("""
 
 You are a professional YouTube video summarizer and study-notes creator.
 
-
-
 Create a concise, well-organized, POINT-WISE summary in {language}.
-
-
 
 STRICT FORMATTING RULES:
 
-\- Return Markdown headings, numbered lists and bullet points.
+\\- Return Markdown headings, numbered lists and bullet points.
 
-\- Never use tables.
+\\- Never use tables.
 
-\- Never write long paragraphs.
+\\- Never write long paragraphs.
 
-\- Use short, clear, useful points.
+\\- Use short, clear, useful points.
 
-\- Do not output HTML tags such as \<br>.
+\\- Do not output HTML tags such as \\<br>.
 
-\- Use \*\*bold\*\* only for important terms; do not escape Markdown characters.
+\\- Use \\\*\\\*bold\\\*\\\* only for important terms; do not escape Markdown characters.
 
-\- Use numbered lists for processes, steps, characteristics and components.
+\\- Use numbered lists for processes, steps, characteristics and components.
 
-\- Include timestamps only when exact timestamps appear in the supplied source.
+\\- Include timestamps only when exact timestamps appear in the supplied source.
 
-\- Do not invent timestamps, names, definitions, examples, facts or components.
+\\- Do not invent timestamps, names, definitions, examples, facts or components.
 
-\- Do not repeat the same information in multiple sections.
+\\- Do not repeat the same information in multiple sections.
 
-\- Combine transcript and slide OCR evidence where relevant.
+\\- Combine transcript and slide OCR evidence where relevant.
 
-\- Treat unclear OCR cautiously.
+\\- Treat unclear OCR cautiously.
 
-\- Summarize only what the supplied source supports.
-
-
+\\- Summarize only what the supplied source supports.
 
 FOLLOW THIS OUTPUT STRUCTURE:
 
+\\## 1. Video Overview
 
+\\- Give 2-4 short bullet points.
 
-\## 1. Video Overview
+\\## 2. Main Topics Covered
 
-\- Give 2-4 short bullet points.
+\\- List important topics in the order they appear.
 
+\\- Use a short bold topic heading.
 
+\\- Add 1-3 concise bullet points under each topic.
 
-\## 2. Main Topics Covered
+\\- Include an exact timestamp in the topic heading only when available.
 
-\- List important topics in the order they appear.
+\\## 3. Key Learning Points
 
-\- Use a short bold topic heading.
+\\- Give the main concepts as numbered or bulleted points.
 
-\- Add 1-3 concise bullet points under each topic.
+\\- Explain each point briefly.
 
-\- Include an exact timestamp in the topic heading only when available.
+\\## 4. Important Terms / Components
 
+\\- List important terms, components or names mentioned.
 
+\\- Explain them briefly only when the source supports the explanation.
 
-\## 3. Key Learning Points
+\\## 5. Conclusion
 
-\- Give the main concepts as numbered or bulleted points.
-
-\- Explain each point briefly.
-
-
-
-\## 4. Important Terms / Components
-
-\- List important terms, components or names mentioned.
-
-\- Explain them briefly only when the source supports the explanation.
-
-
-
-\## 5. Conclusion
-
-\- Give 2-3 short bullet points.
-
-
+\\- Give 2-3 short bullet points.
 
 LANGUAGE:
 
 {language_instruction}
 
-
-
 Selected response language: {language}
-
-
 
 COMPLETE VIDEO NOTES / SOURCE:
 
@@ -1954,11 +1457,9 @@ COMPLETE VIDEO NOTES / SOURCE:
 
 """)
 
+    final_chain = final_prompt | summary_llm | StrOutputParser()
 
-
-    final_chain = final_prompt | llm | StrOutputParser()
-
-    summary = final_chain.invoke({
+    summary = invoke_summary_with_retry(final_chain, {
 
         "content": source_content,
 
@@ -1968,35 +1469,50 @@ COMPLETE VIDEO NOTES / SOURCE:
 
     })
 
-
-
     return summary.strip()
+
 def add_manual_transcript(video_id: str, transcript: str, language="English") -> dict:
+
     """
+
     Load user-pasted transcript into the existing Hybrid RAG pipeline.
+
     """
 
     language = validate_language(language)
 
     if not transcript or not transcript.strip():
+
         raise ValueError("Please paste a valid transcript.")
 
     transcript = transcript.strip()
 
     # Manual transcript has no reliable timestamps,
+
     # so keep it as one segment starting at 00:00.
+
     transcript_segments = [
+
         {
+
             "timestamp": "00:00",
+
             "start": 0.0,
+
             "text": transcript
+
         }
+
     ]
 
     language_codes = {
+
         "English": "en",
+
         "Hindi": "hi",
+
         "Hinglish": "hi"
+
     }
 
     language_code = language_codes[language]
@@ -2006,34 +1522,55 @@ def add_manual_transcript(video_id: str, transcript: str, language="English") ->
     video_info = get_video_info(video_id)
 
     # Manual transcript is indexed with the existing FAISS pipeline.
+
     vector_store = create_hybrid_vector_store(
+
         video_id=video_id,
+
         transcript_segments=transcript_segments,
+
         ocr_segments=[],
+
         language_code=language_code
+
     )
 
     video_data = {
+
         "video": video_info,
+
         "segments": transcript_segments,
+
         "transcript_language": language,
+
         "transcript_language_code": language_code,
+
         "transcript_is_generated": False,
+
         "ocr_segments": [],
+
         "ocr_error": None,
+
         "vector_store": vector_store
+
     }
 
     VIDEO_CACHE[video_id] = video_data
+
     VIDEO_CACHE.move_to_end(video_id)
 
     while len(VIDEO_CACHE) > MAX_CACHED_VIDEOS:
+
         VIDEO_CACHE.popitem(last=False)
+
         gc.collect()
 
     print("Manual transcript loaded successfully.")
 
     return {
+
         "video": video_info,
+
         "transcript_segments": transcript_segments
+
     }
