@@ -1,12 +1,18 @@
-
 "use strict";
 
 /* =========================================
    1. CONFIGURATION
 ========================================= */
 
+const IS_LOCAL =
+    location.hostname === "localhost" ||
+    location.hostname === "127.0.0.1";
+
 const CONFIG = {
-    API_BASE_URL: "http://127.0.0.1:8000",
+    // TODO: "TUMHARA-APP" ki jagah apna asli Render URL daalo
+    API_BASE_URL: IS_LOCAL
+        ? "http://127.0.0.1:8000"
+        : "https://youtube-chatbot-6kzr.onrender.com",
 
     ENDPOINTS: {
         health: "/health",
@@ -45,21 +51,15 @@ function extractVideoId(raw) {
 
         if (host === "youtu.be") {
             id = parts[0];
-        } else if (
-            host === "youtube.com" ||
-            host === "m.youtube.com"
-        ) {
+        } else if (host === "youtube.com" || host === "m.youtube.com") {
             if (url.pathname === "/watch") {
                 id = url.searchParams.get("v");
-            } else if (
-                ["shorts", "embed", "live"].includes(parts[0])
-            ) {
+            } else if (["shorts", "embed", "live"].includes(parts[0])) {
                 id = parts[1];
             }
         }
 
         return id && /^[\w-]{11}$/.test(id) ? id : null;
-
     } catch {
         return null;
     }
@@ -99,7 +99,6 @@ function toast(message, type = "info") {
     element.hidden = false;
 
     clearTimeout(toastTimer);
-
     toastTimer = setTimeout(() => {
         element.hidden = true;
     }, 4500);
@@ -123,34 +122,20 @@ function showFieldError(message) {
 ========================================= */
 
 async function apiFetch(path, options = {}) {
-    const {
-        method = "GET",
-        body = undefined
-    } = options;
+    const { method = "GET", body = undefined } = options;
 
     const controller = new AbortController();
-
-    const timer = setTimeout(() => {
-        controller.abort();
-    }, CONFIG.REQUEST_TIMEOUT);
+    const timer = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
 
     try {
-        const response = await fetch(
-            CONFIG.API_BASE_URL + path,
-            {
-                method,
-
-                headers: body !== undefined
-                    ? { "Content-Type": "application/json" }
-                    : undefined,
-
-                body: body !== undefined
-                    ? JSON.stringify(body)
-                    : undefined,
-
-                signal: controller.signal
-            }
-        );
+        const response = await fetch(CONFIG.API_BASE_URL + path, {
+            method,
+            headers: body !== undefined
+                ? { "Content-Type": "application/json" }
+                : undefined,
+            body: body !== undefined ? JSON.stringify(body) : undefined,
+            signal: controller.signal
+        });
 
         let data = null;
 
@@ -162,12 +147,10 @@ async function apiFetch(path, options = {}) {
 
         if (!response.ok) {
             const detail = data?.detail;
-
             let message = `Request failed: ${response.status}`;
 
             if (typeof detail === "string") {
                 message = detail;
-
             } else if (Array.isArray(detail)) {
                 message = detail
                     .map(item => item.msg || JSON.stringify(item))
@@ -186,7 +169,7 @@ async function apiFetch(path, options = {}) {
 
         if (error instanceof TypeError) {
             throw new Error(
-                "Cannot connect to the backend. Please check the server and internet connection."
+                "Cannot connect to the backend. The server may be waking up (wait up to 1 minute) or restarting. Please try again."
             );
         }
 
@@ -203,23 +186,14 @@ async function apiFetch(path, options = {}) {
 ========================================= */
 
 function setView(name) {
-
     document.querySelectorAll(".view").forEach(view => {
-
         const isActive = view.id === `view-${name}`;
-
         view.classList.toggle("active", isActive);
         view.hidden = !isActive;
-
     });
 
     document.querySelectorAll(".nav-btn").forEach(button => {
-
-        button.classList.toggle(
-            "active",
-            button.dataset.view === name
-        );
-
+        button.classList.toggle("active", button.dataset.view === name);
     });
 
     if (name === "history") {
@@ -233,11 +207,9 @@ function setView(name) {
 ========================================= */
 
 function applyTheme(theme) {
-
     document.documentElement.dataset.theme = theme;
 
     const button = $("themeToggle");
-
     if (button) {
         button.textContent = theme === "dark" ? "☀️" : "🌙";
     }
@@ -250,7 +222,6 @@ function applyTheme(theme) {
 }
 
 function initTheme() {
-
     let savedTheme = null;
 
     try {
@@ -273,83 +244,58 @@ function initTheme() {
 ========================================= */
 
 function getHistory() {
-
     try {
-
         const history = JSON.parse(
             localStorage.getItem(CONFIG.HISTORY_KEY) || "[]"
         );
-
         return Array.isArray(history) ? history : [];
-
     } catch {
         return [];
     }
 }
 
 function setHistory(history) {
-
     try {
-
-        localStorage.setItem(
-            CONFIG.HISTORY_KEY,
-            JSON.stringify(history)
-        );
-
+        localStorage.setItem(CONFIG.HISTORY_KEY, JSON.stringify(history));
     } catch {
         // Ignore storage errors.
     }
 }
 
 function saveHistory(entry) {
-
-    const history = getHistory().filter(
-        item => item.id !== entry.id
-    );
-
+    const history = getHistory().filter(item => item.id !== entry.id);
     history.unshift(entry);
-
     setHistory(history.slice(0, CONFIG.HISTORY_LIMIT));
 }
 
 function renderHistory() {
-
     const container = $("historyList");
-
     if (!container) return;
 
     const history = getHistory();
 
     if (!history.length) {
-
         container.innerHTML =
             '<p class="muted">No videos yet. Load a video from Home.</p>';
-
         return;
     }
 
     container.innerHTML = history.map(item => `
-
         <div class="hist">
-
             <div>
                 <strong>${escapeHtml(item.title)}</strong>
-
                 <span class="muted">
                     ${escapeHtml(item.channel)}
                     · ${escapeHtml(new Date(item.at).toLocaleString())}
                 </span>
             </div>
-
             <button
                 class="btn ghost small"
                 type="button"
                 data-url="${escapeHtml(item.url)}">
                 Load
             </button>
-
         </div>
-
     `).join("");
 }
 
@@ -359,35 +305,23 @@ function renderHistory() {
 ========================================= */
 
 function setLoading(isLoading, message = "") {
-
     if ($("loadBtn")) {
-
         $("loadBtn").disabled = isLoading;
-
-        $("loadBtn").classList.toggle(
-            "loading",
-            isLoading
-        );
+        $("loadBtn").classList.toggle("loading", isLoading);
     }
 
     if ($("loadBtnText")) {
-
-        $("loadBtnText").textContent =
-            isLoading ? "Loading..." : "Load Video";
+        $("loadBtnText").textContent = isLoading ? "Loading..." : "Load Video";
     }
 
     if ($("loadStatus")) {
-
         $("loadStatus").textContent = message;
-
         $("loadStatus").hidden = !isLoading;
     }
 }
 
 function setManualTranscriptVisible(visible) {
-
     const box = $("manualTranscriptBox");
-
     if (box) {
         box.hidden = !visible;
     }
@@ -399,59 +333,40 @@ function setManualTranscriptVisible(visible) {
 ========================================= */
 
 async function handleLoad(event) {
-
     event.preventDefault();
 
     const url = $("urlInput")?.value.trim();
-
     const language = getSelectedLanguage();
 
     if (!url) {
-
         showFieldError("Please paste a YouTube URL.");
-
         return;
     }
 
     const videoId = extractVideoId(url);
 
     if (!videoId) {
-
         showFieldError("Invalid YouTube URL.");
-
         return;
     }
 
     showFieldError("");
-
     setManualTranscriptVisible(false);
-
     state.videoId = videoId;
 
-    setLoading(
-        true,
-        "Analyzing video and preparing AI features..."
-    );
+    setLoading(true, "Analyzing video and preparing AI features...");
 
     try {
-
-        const data = await apiFetch(
-            CONFIG.ENDPOINTS.loadVideo,
-            {
-                method: "POST",
-
-                body: {
-                    video_url: url,
-                    language: language
-                }
+        const data = await apiFetch(CONFIG.ENDPOINTS.loadVideo, {
+            method: "POST",
+            body: {
+                video_url: url,
+                language: language
             }
-        );
+        });
 
         if (!data.video_id) {
-
-            throw new Error(
-                "Video ID missing from backend response."
-            );
+            throw new Error("Video ID missing from backend response.");
         }
 
         state.videoId = data.video_id;
@@ -466,28 +381,6 @@ async function handleLoad(event) {
             $("workspace").hidden = false;
         }
 
-        if (data.summary) {
-
-            renderSummary(data.summary);
-
-            $("summaryBody").hidden = false;
-            $("summaryError").hidden = true;
-            $("summaryLoading").hidden = true;
-
-        } else {
-
-            $("summaryBody").hidden = true;
-            $("summaryLoading").hidden = true;
-
-            if ($("summaryError")) {
-
-                $("summaryError").textContent =
-                    data.summary_error || "Summary unavailable.";
-
-                $("summaryError").hidden = false;
-            }
-        }
-
         saveHistory({
             id: state.videoId,
             url: url,
@@ -500,8 +393,17 @@ async function handleLoad(event) {
 
         toast("Video loaded successfully!");
 
-    } catch (error) {
+        // Summary ab alag request me load hoti hai (server par timeout na ho).
+        if (data.summary) {
+            renderSummary(data.summary);
+            $("summaryBody").hidden = false;
+            $("summaryError").hidden = true;
+            $("summaryLoading").hidden = true;
+        } else {
+            loadSummary();
+        }
 
+    } catch (error) {
         console.error("Video loading error:", error);
 
         state.videoId = videoId;
@@ -513,9 +415,7 @@ async function handleLoad(event) {
         );
 
     } finally {
-
         setLoading(false);
-
     }
 }
 
@@ -525,29 +425,17 @@ async function handleLoad(event) {
 ========================================= */
 
 async function handleManualTranscript(event) {
-
     event.preventDefault();
 
-    const transcript =
-        $("manualTranscriptInput")?.value.trim();
+    const transcript = $("manualTranscriptInput")?.value.trim();
 
     if (!state.videoId) {
-
-        toast(
-            "Please enter and load a valid YouTube video URL first.",
-            "error"
-        );
-
+        toast("Please enter and load a valid YouTube video URL first.", "error");
         return;
     }
 
     if (!transcript || transcript.length < 20) {
-
-        toast(
-            "Please paste a valid transcript (at least 20 characters).",
-            "error"
-        );
-
+        toast("Please paste a valid transcript (at least 20 characters).", "error");
         return;
     }
 
@@ -559,31 +447,22 @@ async function handleManualTranscript(event) {
     }
 
     try {
-
-        const data = await apiFetch(
-            CONFIG.ENDPOINTS.manualTranscript,
-            {
-                method: "POST",
-
-                body: {
-                    video_id: state.videoId,
-                    transcript: transcript,
-                    language: getSelectedLanguage()
-                }
+        const data = await apiFetch(CONFIG.ENDPOINTS.manualTranscript, {
+            method: "POST",
+            body: {
+                video_id: state.videoId,
+                transcript: transcript,
+                language: getSelectedLanguage()
             }
-        );
+        });
 
         if (data.video) {
-
             renderVideo(data.video);
-
         } else {
-
             renderVideo({
                 title: "YouTube Video",
                 channel: "YouTube",
-                thumbnail:
-                    `https://img.youtube.com/vi/${state.videoId}/hqdefault.jpg`
+                thumbnail: `https://img.youtube.com/vi/${state.videoId}/hqdefault.jpg`
             });
         }
 
@@ -608,7 +487,6 @@ async function handleManualTranscript(event) {
         });
 
         setManualTranscriptVisible(false);
-
         resetChat();
 
         if ($("summaryLoading")) {
@@ -623,25 +501,23 @@ async function handleManualTranscript(event) {
             $("summaryError").hidden = true;
         }
 
-        toast(
-            `Transcript processed successfully (${data.transcript_segments || 0} segments).`
-        );
+        const count = Array.isArray(data.transcript_segments)
+            ? data.transcript_segments.length
+            : (data.transcript_segments || 0);
+
+        toast(`Transcript processed successfully (${count} segments).`);
 
         await loadSummary();
 
     } catch (error) {
-
         console.error("Manual transcript error:", error);
-
         toast(error.message, "error");
 
     } finally {
-
         if (button) {
             button.disabled = false;
             button.textContent = "Process Transcript";
         }
-
     }
 }
 
@@ -651,33 +527,23 @@ async function handleManualTranscript(event) {
 ========================================= */
 
 function renderVideo(video) {
-
     if ($("videoTitle")) {
-
-        $("videoTitle").textContent =
-            video.title || "YouTube Video";
+        $("videoTitle").textContent = video.title || "YouTube Video";
     }
 
     if ($("videoChannel")) {
-
-        $("videoChannel").textContent =
-            video.channel || "Unknown Channel";
+        $("videoChannel").textContent = video.channel || "Unknown Channel";
     }
 
     if ($("videoDuration")) {
-
-        $("videoDuration").textContent =
-            video.duration || "";
+        $("videoDuration").textContent = video.duration || "";
     }
 
     if ($("thumb")) {
-
         $("thumb").src =
             video.thumbnail ||
             `https://img.youtube.com/vi/${state.videoId}/hqdefault.jpg`;
-
-        $("thumb").alt =
-            video.title || "YouTube video thumbnail";
+        $("thumb").alt = video.title || "YouTube video thumbnail";
     }
 
     initPlayer(state.videoId);
@@ -691,7 +557,6 @@ function renderVideo(video) {
 let youtubeApiPromise = null;
 
 function loadYouTubeApi() {
-
     if (window.YT && window.YT.Player) {
         return Promise.resolve();
     }
@@ -701,68 +566,46 @@ function loadYouTubeApi() {
     }
 
     youtubeApiPromise = new Promise((resolve, reject) => {
-
         window.onYouTubeIframeAPIReady = resolve;
 
         const script = document.createElement("script");
-
         script.src = "https://www.youtube.com/iframe_api";
 
         script.onerror = () => {
-
             youtubeApiPromise = null;
-
-            reject(
-                new Error("YouTube player API could not load.")
-            );
+            reject(new Error("YouTube player API could not load."));
         };
 
         document.head.appendChild(script);
-
     });
 
     return youtubeApiPromise;
 }
 
 async function initPlayer(videoId) {
-
     try {
-
         await loadYouTubeApi();
 
-        if (
-            state.player &&
-            typeof state.player.loadVideoById === "function"
-        ) {
-
+        if (state.player && typeof state.player.loadVideoById === "function") {
             state.player.loadVideoById(videoId);
-
             return;
         }
 
         if (!$("player")) return;
 
         state.player = new YT.Player("player", {
-
             videoId: videoId,
-
             width: "100%",
-
             height: "100%",
-
             playerVars: {
                 rel: 0,
                 playsinline: 1
             }
-
         });
 
     } catch (error) {
-
         console.error("YouTube player error:", error);
-
         toast(error.message, "error");
-
     }
 }
 
@@ -772,9 +615,7 @@ async function initPlayer(videoId) {
 ========================================= */
 
 function renderSummary(markdown) {
-
     const container = $("summaryText");
-
     if (!container) return;
 
     container.replaceChildren();
@@ -792,78 +633,51 @@ function renderSummary(markdown) {
     let activeListType = null;
 
     function closeList() {
-
         activeList = null;
         activeListType = null;
-
     }
 
     function appendInline(parent, value) {
-
         const text = String(value || "");
-
-        const tokenPattern =
-            /(\*\*[^\*]+\*\*|__[^\_]+__|\*[^\*]+\*|_[^\_]+_)/g;
+        const tokenPattern = /(\*\*[^\*]+\*\*|__[^\_]+__|\*[^\*]+\*|_[^\_]+_)/g;
 
         let cursor = 0;
         let match;
 
         while ((match = tokenPattern.exec(text)) !== null) {
-
             if (match.index > cursor) {
-
                 parent.appendChild(
-                    document.createTextNode(
-                        text.slice(cursor, match.index)
-                    )
+                    document.createTextNode(text.slice(cursor, match.index))
                 );
             }
 
             const token = match[0];
-
-            const isBold =
-                token.startsWith("**") ||
-                token.startsWith("__");
-
-            const element = document.createElement(
-                isBold ? "strong" : "em"
-            );
+            const isBold = token.startsWith("**") || token.startsWith("__");
+            const element = document.createElement(isBold ? "strong" : "em");
 
             element.textContent = isBold
                 ? token.slice(2, -2)
                 : token.slice(1, -1);
 
             parent.appendChild(element);
-
             cursor = tokenPattern.lastIndex;
-
         }
 
         if (cursor < text.length) {
-
-            parent.appendChild(
-                document.createTextNode(
-                    text.slice(cursor)
-                )
-            );
-
+            parent.appendChild(document.createTextNode(text.slice(cursor)));
         }
     }
 
     for (const rawLine of lines) {
-
         const line = rawLine.trim();
 
         if (!line || /^[-*_]{3,}$/.test(line)) {
-
             closeList();
-
             continue;
         }
 
         // Markdown table fallback.
         if (line.startsWith("|") && line.endsWith("|")) {
-
             if (/^\|[\s:|-]+\|$/.test(line)) {
                 continue;
             }
@@ -877,15 +691,10 @@ function renderSummary(markdown) {
                 .filter(Boolean);
 
             if (cells.length) {
-
                 const paragraph = document.createElement("p");
-
                 paragraph.className = "summary-table-fallback";
-
                 appendInline(paragraph, cells.join(" — "));
-
                 container.appendChild(paragraph);
-
             }
 
             continue;
@@ -895,20 +704,13 @@ function renderSummary(markdown) {
         const headingMatch = line.match(/^(#{1,4})\s+(.+)$/);
 
         if (headingMatch) {
-
             closeList();
 
-            const level = Math.min(
-                headingMatch[1].length + 1,
-                4
-            );
-
+            const level = Math.min(headingMatch[1].length + 1, 4);
             const heading = document.createElement(`h${level}`);
 
             appendInline(heading, headingMatch[2]);
-
             container.appendChild(heading);
-
             continue;
         }
 
@@ -919,30 +721,18 @@ function renderSummary(markdown) {
         const numberMatch = line.match(/^\d+[.)]\s+(.+)$/);
 
         if (bulletMatch || numberMatch) {
-
             const listType = bulletMatch ? "ul" : "ol";
 
             if (!activeList || activeListType !== listType) {
-
                 closeList();
-
                 activeList = document.createElement(listType);
-
                 activeListType = listType;
-
                 container.appendChild(activeList);
-
             }
 
             const item = document.createElement("li");
-
-            appendInline(
-                item,
-                (bulletMatch || numberMatch)[1]
-            );
-
+            appendInline(item, (bulletMatch || numberMatch)[1]);
             activeList.appendChild(item);
-
             continue;
         }
 
@@ -950,11 +740,8 @@ function renderSummary(markdown) {
         closeList();
 
         const paragraph = document.createElement("p");
-
         appendInline(paragraph, line);
-
         container.appendChild(paragraph);
-
     }
 }
 
@@ -964,11 +751,8 @@ function renderSummary(markdown) {
 ========================================= */
 
 async function loadSummary() {
-
     if (!state.videoId) {
-
         toast("Load a video first.", "error");
-
         return;
     }
 
@@ -979,37 +763,25 @@ async function loadSummary() {
     const videoId = state.videoId;
 
     try {
-
-        const data = await apiFetch(
-            CONFIG.ENDPOINTS.summary,
-            {
-                method: "POST",
-
-                body: {
-                    video_id: videoId,
-                    language: getSelectedLanguage()
-                }
+        const data = await apiFetch(CONFIG.ENDPOINTS.summary, {
+            method: "POST",
+            body: {
+                video_id: videoId,
+                language: getSelectedLanguage()
             }
-        );
+        });
 
         if (videoId !== state.videoId) return;
 
-        renderSummary(
-            data.summary || "No summary available."
-        );
-
+        renderSummary(data.summary || "No summary available.");
         $("summaryBody").hidden = false;
 
     } catch (error) {
-
         $("summaryError").textContent = error.message;
-
         $("summaryError").hidden = false;
 
     } finally {
-
         $("summaryLoading").hidden = true;
-
     }
 }
 
@@ -1019,64 +791,45 @@ async function loadSummary() {
 ========================================= */
 
 function formatAnswer(answer) {
-
     return escapeHtml(answer)
-
-        .replace(
-            /\*\*(.+?)\*\*/g,
-            "<strong>$1</strong>"
-        )
-
+        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
         .replace(/\n/g, "<br>");
-
 }
 
 function scrollChat() {
-
     const container = $("chatMessages");
-
     if (!container) return;
 
     container.scrollTo({
         top: container.scrollHeight,
         behavior: "smooth"
     });
-
 }
 
 function addMessage(role, html) {
-
     const container = $("chatMessages");
-
     if (!container) return null;
 
     const message = document.createElement("div");
-
     message.className = `msg ${role}`;
 
     message.innerHTML = `
-
         <div class="avatar">
             ${role === "user" ? "Y" : "AI"}
         </div>
-
         <div class="bubble">
             ${html}
         </div>
-
     `;
 
     container.appendChild(message);
-
     scrollChat();
 
     return message;
 }
 
 function resetChat() {
-
     const container = $("chatMessages");
-
     if (!container) return;
 
     container.innerHTML = "";
@@ -1085,7 +838,6 @@ function resetChat() {
         "ai",
         "Hi! Ask me anything about this video. I will answer using the video content."
     );
-
 }
 
 
@@ -1094,7 +846,6 @@ function resetChat() {
 ========================================= */
 
 async function handleSend(event) {
-
     event.preventDefault();
 
     const question = $("chatInput")?.value.trim();
@@ -1102,24 +853,17 @@ async function handleSend(event) {
     if (!question || state.busy) return;
 
     if (!state.videoId) {
-
         toast("Please load a video first.", "error");
-
         return;
     }
 
     // Show user message.
-    addMessage(
-        "user",
-        escapeHtml(question).replace(/\n/g, "<br>")
-    );
+    addMessage("user", escapeHtml(question).replace(/\n/g, "<br>"));
 
     $("chatInput").value = "";
-
     autoGrow();
 
     state.busy = true;
-
     $("sendBtn").disabled = true;
 
     const typing = addMessage(
@@ -1128,46 +872,38 @@ async function handleSend(event) {
     );
 
     try {
-
-        const data = await apiFetch(
-            CONFIG.ENDPOINTS.chat,
-            {
-                method: "POST",
-
-                body: {
-                    video_id: state.videoId,
-                    question: question,
-                    language: getSelectedLanguage()
-                }
+        const data = await apiFetch(CONFIG.ENDPOINTS.chat, {
+            method: "POST",
+            body: {
+                video_id: state.videoId,
+                question: question,
+                language: getSelectedLanguage()
             }
-        );
+        });
 
         typing?.remove();
 
-        addMessage(
-            "ai",
-            formatAnswer(data.answer || "No answer received.")
-        );
+        addMessage("ai", formatAnswer(data.answer || "No answer received."));
 
     } catch (error) {
-
         typing?.remove();
 
-        addMessage(
-            "ai error",
-            escapeHtml(error.message)
-        );
+        let message = error.message;
 
+        // Render restart hone par server memory se video hat jata hai.
+        if (message.toLowerCase().includes("not loaded")) {
+            message =
+                "Server restart hua tha, isliye video memory se hat gaya. " +
+                "Upar video link dobara 'Load Video' karo, phir sawal pucho.";
+        }
+
+        addMessage("ai error", escapeHtml(message));
         console.error("Chat error:", error);
 
     } finally {
-
         state.busy = false;
-
         $("sendBtn").disabled = false;
-
         $("chatInput").focus();
-
     }
 }
 
@@ -1177,16 +913,11 @@ async function handleSend(event) {
 ========================================= */
 
 function autoGrow() {
-
     const input = $("chatInput");
-
     if (!input) return;
 
     input.style.height = "auto";
-
-    input.style.height =
-        Math.min(input.scrollHeight, 120) + "px";
-
+    input.style.height = Math.min(input.scrollHeight, 120) + "px";
 }
 
 
@@ -1195,148 +926,78 @@ function autoGrow() {
 ========================================= */
 
 function init() {
-
     // Theme
     initTheme();
 
     $("themeToggle")?.addEventListener("click", () => {
-
-        const current =
-            document.documentElement.dataset.theme;
-
-        applyTheme(
-            current === "dark" ? "light" : "dark"
-        );
-
+        const current = document.documentElement.dataset.theme;
+        applyTheme(current === "dark" ? "light" : "dark");
     });
 
     // Navigation
     $("nav")?.addEventListener("click", event => {
-
         const button = event.target.closest(".nav-btn");
-
         if (button) {
             setView(button.dataset.view);
         }
-
     });
 
     // Video form
-    $("videoForm")?.addEventListener(
-        "submit",
-        handleLoad
-    );
+    $("videoForm")?.addEventListener("submit", handleLoad);
 
     // Manual transcript form
-    $("manualTranscriptForm")?.addEventListener(
-        "submit",
-        handleManualTranscript
-    );
+    $("manualTranscriptForm")?.addEventListener("submit", handleManualTranscript);
 
     // Chat form
-    $("chatForm")?.addEventListener(
-        "submit",
-        handleSend
-    );
+    $("chatForm")?.addEventListener("submit", handleSend);
 
     // Clear chat
-    $("clearChat")?.addEventListener(
-        "click",
-        resetChat
-    );
+    $("clearChat")?.addEventListener("click", resetChat);
 
     // Language change
-    $("languageSelect")?.addEventListener(
-        "change",
-        () => {
-
-            if (state.videoId) {
-                loadSummary();
-            }
-
+    $("languageSelect")?.addEventListener("change", () => {
+        if (state.videoId) {
+            loadSummary();
         }
-    );
+    });
 
     // Chat input
-    $("chatInput")?.addEventListener(
-        "input",
-        autoGrow
-    );
+    $("chatInput")?.addEventListener("input", autoGrow);
 
     // Enter to send
-    $("chatInput")?.addEventListener(
-        "keydown",
-        event => {
-
-            if (
-                event.key === "Enter" &&
-                !event.shiftKey
-            ) {
-
-                event.preventDefault();
-
-                $("chatForm")?.requestSubmit();
-
-            }
-
+    $("chatInput")?.addEventListener("keydown", event => {
+        if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            $("chatForm")?.requestSubmit();
         }
-    );
+    });
 
     // Clear history
-    $("clearHistory")?.addEventListener(
-        "click",
-        () => {
-
-            setHistory([]);
-
-            renderHistory();
-
-            toast("History cleared.");
-
-        }
-    );
+    $("clearHistory")?.addEventListener("click", () => {
+        setHistory([]);
+        renderHistory();
+        toast("History cleared.");
+    });
 
     // Load video from history
-    $("historyList")?.addEventListener(
-        "click",
-        event => {
+    $("historyList")?.addEventListener("click", event => {
+        const button = event.target.closest("[data-url]");
+        if (!button) return;
 
-            const button =
-                event.target.closest("[data-url]");
+        $("urlInput").value = button.dataset.url;
+        setView("home");
+        $("videoForm")?.requestSubmit();
+    });
 
-            if (!button) return;
-
-            $("urlInput").value = button.dataset.url;
-
-            setView("home");
-
-            $("videoForm")?.requestSubmit();
-
-        }
-    );
-
-    // Backend health check
+    // Backend health check (free Render server so raha ho to jagane ke liye)
     apiFetch(CONFIG.ENDPOINTS.health)
-
         .then(() => {
-
-            console.log(
-                "FastAPI backend connected successfully."
-            );
-
+            console.log("FastAPI backend connected successfully.");
         })
-
         .catch(error => {
-
-            console.error(
-                "Backend connection failed:",
-                error
-            );
-
-            toast(error.message, "error");
-
+            console.error("Backend connection failed:", error);
+            toast("Server is waking up, please wait up to 1 minute...", "error");
         });
-
 }
 
 
@@ -1344,7 +1005,4 @@ function init() {
    19. START APPLICATION
 ========================================= */
 
-document.addEventListener(
-    "DOMContentLoaded",
-    init
-);
+document.addEventListener("DOMContentLoaded", init);

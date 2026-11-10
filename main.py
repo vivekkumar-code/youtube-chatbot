@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -19,7 +18,7 @@ from youtube_chatbot import (
 app = FastAPI(
     title="YouTube AI Chatbot",
     description="Chat with YouTube videos using Hybrid RAG (Transcript + Local OCR)",
-    version="3.1.0",
+    version="3.2.0",
 )
 
 
@@ -121,24 +120,12 @@ def health_check():
 def load_youtube_video(request: VideoRequest):
 
     try:
-        # Extract transcript and attempt video frame OCR.
+        # Transcript extract karo + index banao.
+        # Summary yahan generate nahi hoti (timeout se bachne ke liye).
+        # Frontend load hone ke baad alag se /api/summary call karta hai.
         data = load_video(request.video_url)
 
         video_id = data["video"]["video_id"]
-
-        summary = None
-        summary_error = None
-
-        # Generate initial summary.
-        try:
-            summary = generate_summary(
-                video_id,
-                request.language
-            )
-
-        except Exception as exc:
-            summary_error = str(exc)
-            print("Summary generation failed:", repr(exc))
 
         return {
             "status": "success",
@@ -158,8 +145,8 @@ def load_youtube_video(request: VideoRequest):
 
             "ocr_error": data.get("ocr_error"),
 
-            "summary": summary,
-            "summary_error": summary_error,
+            "summary": None,
+            "summary_error": None,
         }
 
     except ValueError as exc:
@@ -175,6 +162,7 @@ def load_youtube_video(request: VideoRequest):
             status_code=500,
             detail=f"Video loading failed: {str(exc)}",
         )
+
 
 # =========================================
 # 7. MANUAL TRANSCRIPT
