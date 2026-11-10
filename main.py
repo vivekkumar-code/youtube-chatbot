@@ -1,13 +1,15 @@
+from typing import List, Literal, Optional
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Literal
 
 from youtube_chatbot import (
     load_video,
     ask_question,
     generate_summary,
-    add_manual_transcript,
+    GEMINI_MODEL,
+    gemini_client,
 )
 
 
@@ -17,8 +19,8 @@ from youtube_chatbot import (
 
 app = FastAPI(
     title="YouTube AI Chatbot",
-    description="Chat with YouTube videos using Hybrid RAG (Transcript + Local OCR)",
-    version="3.2.0",
+    description="Paste a YouTube link and chat with the video (RAG).",
+    version="4.0.0",
 )
 
 
@@ -48,116 +50,79 @@ app.add_middleware(
 Language = Literal["English", "Hindi", "Hinglish"]
 
 
+class HistoryItem(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=4000)
+
+
 class VideoRequest(BaseModel):
-    video_url: str = Field(
-        min_length=10,
-        description="YouTube video URL"
-    )
+    video_url: str = Field(min_length=10)
     language: Language = "English"
 
 
 class ChatRequest(BaseModel):
-    video_id: str = Field(
-        min_length=11,
-        max_length=11
-    )
-    question: str = Field(
-        min_length=1,
-        max_length=2000
-    )
+    video_id: str = Field(min_length=11, max_length=11)
+    question: str = Field(min_length=1, max_length=2000)
     language: Language = "English"
+    video_url: Optional[str] = None
+    history: List[HistoryItem] = Field(default_factory=list, max_length=12)
 
 
 class SummaryRequest(BaseModel):
-    video_id: str = Field(
-        min_length=11,
-        max_length=11
-    )
+    video_id: str = Field(min_length=11, max_length=11)
     language: Language = "English"
-
-
-class ManualTranscriptRequest(BaseModel):
-    video_id: str = Field(
-        min_length=11,
-        max_length=11
-    )
-    transcript: str = Field(
-        min_length=20,
-        max_length=1000000
-    )
-    language: Language = "English"
+    video_url: Optional[str] = None
 
 
 # =========================================
-# 4. HOME ROUTE
+# 4. HOME + HEALTH
 # =========================================
 
 @app.get("/")
 def home():
     return {
         "status": "success",
-        "message": "YouTube AI Chatbot Hybrid RAG API is running!",
+        "message": "YouTube AI Chatbot RAG API is running!",
     }
 
-
-# =========================================
-# 5. HEALTH CHECK
-# =========================================
 
 @app.get("/health")
 def health_check():
     return {
         "status": "healthy",
-        "service": "YouTube AI Chatbot Hybrid RAG",
+        "service": "YouTube AI Chatbot RAG",
+        "gemini_configured": gemini_client is not None,
+        "gemini_model": GEMINI_MODEL,
     }
 
 
 # =========================================
-# 6. LOAD YOUTUBE VIDEO
+# 5. LOAD YOUTUBE VIDEO (link only)
 # =========================================
 
 @app.post("/api/load-video")
 def load_youtube_video(request: VideoRequest):
-
     try:
-        # Transcript extract karo + index banao.
-        # Summary yahan generate nahi hoti (timeout se bachne ke liye).
-        # Frontend load hone ke baad alag se /api/summary call karta hai.
         data = load_video(request.video_url)
 
-        video_id = data["video"]["video_id"]
+        video = data["video"]
 
         return {
             "status": "success",
             "message": "Video loaded successfully",
-
-            "video": data["video"],
-            "video_id": video_id,
-
-            "transcript": data["segments"],
-            "transcript_language": data["transcript_language"],
-            "transcript_language_code": data["transcript_language_code"],
-            "transcript_is_generated": data["transcript_is_generated"],
-
-            "ocr_frames_indexed": len(
-                data.get("ocr_segments", [])
-            ),
-
-            "ocr_error": data.get("ocr_error"),
-
+            "video": video,
+            "video_id": video["video_id"],
+            "source": data["source"],
+            "chunks_indexed": len(data["chunks"]),
             "summary": None,
             "summary_error": None,
         }
 
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc)
-        )
+        raise HTTPException(status_code=400, detail=str(exc))
 
     except Exception as exc:
         print("Video loading error:", repr(exc))
-
         raise HTTPException(
             status_code=500,
             detail=f"Video loading failed: {str(exc)}",
@@ -165,53 +130,16 @@ def load_youtube_video(request: VideoRequest):
 
 
 # =========================================
-# 7. MANUAL TRANSCRIPT
-# =========================================
-
-@app.post("/api/manual-transcript")
-def manual_transcript(request: ManualTranscriptRequest):
-
-    try:
-        result = add_manual_transcript(
-            video_id=request.video_id,
-            transcript=request.transcript,
-            language=request.language,
-        )
-
-        return {
-            "status": "success",
-            "message": "Manual transcript added successfully",
-            "video_id": request.video_id,
-            "video": result["video"],
-            "transcript_segments": result["transcript_segments"],
-        }
-
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc)
-        )
-
-    except Exception as exc:
-        print("Manual transcript error:", repr(exc))
-
-        raise HTTPException(
-            status_code=500,
-            detail="Could not process manual transcript.",
-        )
-
-
-# =========================================
-# 8. GENERATE VIDEO SUMMARY
+# 7. SUMMARY
 # =========================================
 
 @app.post("/api/summary")
 def video_summary(request: SummaryRequest):
-
     try:
         summary = generate_summary(
             request.video_id,
-            request.language
+            request.language,
+            video_url=request.video_url,
         )
 
         return {
@@ -221,14 +149,10 @@ def video_summary(request: SummaryRequest):
         }
 
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc)
-        )
+        raise HTTPException(status_code=400, detail=str(exc))
 
     except Exception as exc:
         print("Summary error:", repr(exc))
-
         raise HTTPException(
             status_code=502,
             detail=f"Summary generation failed: {str(exc)}",
@@ -236,17 +160,21 @@ def video_summary(request: SummaryRequest):
 
 
 # =========================================
-# 9. CHAT WITH VIDEO
+# 8. CHAT WITH VIDEO
 # =========================================
 
 @app.post("/api/chat")
 def chat_with_video(request: ChatRequest):
-
     try:
         answer = ask_question(
             video_id=request.video_id,
             question=request.question,
             language=request.language,
+            video_url=request.video_url,
+            history=[
+                {"role": item.role, "content": item.content}
+                for item in request.history
+            ],
         )
 
         return {
@@ -257,18 +185,12 @@ def chat_with_video(request: ChatRequest):
         }
 
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc)
-        )
+        raise HTTPException(status_code=400, detail=str(exc))
 
     except Exception as exc:
-
-        error_message = str(exc)
-
         print("Chat error:", repr(exc))
 
-        if "rate_limit" in error_message.lower():
+        if "rate_limit" in str(exc).lower():
             raise HTTPException(
                 status_code=429,
                 detail="Groq rate limit reached. Please wait and retry.",

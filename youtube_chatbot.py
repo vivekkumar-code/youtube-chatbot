@@ -1,27 +1,36 @@
+"""
+YouTube RAG chatbot (no manual transcript needed).
+
+How the video text is obtained (automatic, in this order):
+  1. YouTube captions via youtube-transcript-api (fast, free).
+  2. If captions are blocked/unavailable (common on Render), the YouTube link
+     is sent straight to the Gemini API, which watches/listens to the video on
+     Google's servers and returns detailed notes of everything said and shown.
+
+RAG: the text is split into chunks, embedded with the Gemini embedding API
+(no local model, so it fits in Render's 512 MB RAM), and the best chunks are
+sent to Groq's LLM together with recent chat history for follow-up doubts.
+"""
+
 import os
 import re
-import cv2
-import tempfile
-import shutil
-import gc
-import threading
+import json
 import time
-
+import gc
 from collections import OrderedDict
-from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from urllib.request import urlopen, Request
 
-import pytesseract
+import numpy as np
 from dotenv import load_dotenv
-from yt_dlp import YoutubeDL
-from youtube_transcript_api import YouTubeTranscriptApi
 from googleapiclient.discovery import build
+from youtube_transcript_api import YouTubeTranscriptApi
 
-from langchain_core.documents import Document
+from google import genai
+from google.genai import types
+
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 
 
@@ -32,61 +41,36 @@ from langchain_groq import ChatGroq
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")  # optional (only for title/channel)
+
+# Model names are configurable because Google renames/retires models.
+# If you get a "model not found" error, set GEMINI_MODEL / EMBED_MODEL
+# in Render's Environment variables to a current model name.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "gemini-embedding-001")
 
 if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY missing in .env file.")
+    raise ValueError("GROQ_API_KEY missing in environment variables.")
 
-# OCR sirf tab chalega jab ENABLE_OCR=true set ho.
-# Local par .env me ENABLE_OCR=true likho.
-# Render par kuch set mat karo (default: false) kyunki free plan me RAM kam hoti hai.
-ENABLE_OCR = os.getenv("ENABLE_OCR", "false").lower() == "true"
+if not GEMINI_API_KEY:
+    print("WARNING: GEMINI_API_KEY not set. Only YouTube captions / manual "
+          "transcript will work (no Gemini video fallback, no embeddings).")
+
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 SUPPORTED_LANGUAGES = ["English", "Hindi", "Hinglish"]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-INDEX_DIR = os.path.join(BASE_DIR, "faiss_indexes")
-os.makedirs(INDEX_DIR, exist_ok=True)
+DATA_DIR = os.path.join(BASE_DIR, "video_data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# OCR sampling interval. Lower = more slide coverage, more processing.
-OCR_INTERVAL_SECONDS = int(os.getenv("OCR_INTERVAL_SECONDS", "30"))
-OCR_MAX_WIDTH = 1600
+CHUNK_SIZE = 900
+CHUNK_OVERLAP = 150
+TOP_K = 6
 
-# Keep only one loaded video's vector store in process memory.
-# This is an in-memory cache only; FAISS indexes are also saved on disk.
 VIDEO_CACHE = OrderedDict()
-MAX_CACHED_VIDEOS = 1
-
-# Embedding model is loaded only when the first video is processed.
-_EMBEDDINGS = None
-_EMBEDDINGS_LOCK = threading.Lock()
-
-
-def get_embeddings():
-    global _EMBEDDINGS
-
-    if _EMBEDDINGS is None:
-        with _EMBEDDINGS_LOCK:
-            if _EMBEDDINGS is None:
-                print("Loading multilingual embedding model (lazy load)...")
-
-                _EMBEDDINGS = HuggingFaceEmbeddings(
-                    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-                    model_kwargs={"device": "cpu"},
-                    encode_kwargs={"normalize_embeddings": True},
-                )
-
-                print("Embedding model loaded.")
-
-    return _EMBEDDINGS
-
-
-# If Tesseract is installed in the standard Windows location but is not
-# on PATH, this makes pytesseract find it.
-WINDOWS_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
-if os.name == "nt" and os.path.exists(WINDOWS_TESSERACT):
-    pytesseract.pytesseract.tesseract_cmd = WINDOWS_TESSERACT
+MAX_CACHED_VIDEOS = 3
 
 print("Initializing Groq LLM...")
 
@@ -97,16 +81,14 @@ llm = ChatGroq(
     api_key=GROQ_API_KEY,
 )
 
-print("Groq LLM initialized.")
-
-# Dedicated, lower-output-token configuration for video summaries.
-# It uses the same Groq model/API key, so it shares the account TPM quota.
 summary_llm = ChatGroq(
     model="openai/gpt-oss-20b",
     temperature=0,
     max_tokens=1000,
     api_key=GROQ_API_KEY,
 )
+
+print("Groq LLM initialized.")
 
 
 def invoke_summary_with_retry(chain, payload, max_retries=2):
@@ -130,12 +112,8 @@ def invoke_summary_with_retry(chain, payload, max_retries=2):
             if attempt >= max_retries or not (is_rate_limit or is_connection_error):
                 raise
 
-            # Groq's TPM window is per minute. Wait a full window on 429.
             wait_seconds = 65 if is_rate_limit else 5 * (attempt + 1)
-            print(
-                f"Summary request temporarily failed ({type(exc).__name__}). "
-                f"Retrying in {wait_seconds}s..."
-            )
+            print(f"Groq call failed ({type(exc).__name__}). Retrying in {wait_seconds}s...")
             time.sleep(wait_seconds)
 
 
@@ -166,72 +144,98 @@ def extract_video_id(url: str) -> str:
     return video_id
 
 
+def validate_language(language: str) -> str:
+    if language not in SUPPORTED_LANGUAGES:
+        raise ValueError("Choose English, Hindi or Hinglish.")
+    return language
+
+
 def format_timestamp(seconds) -> str:
     seconds = max(0, int(float(seconds or 0)))
-
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
     secs = seconds % 60
-
     if hours:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
+        return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def format_iso_duration(value: str) -> str:
+    match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value or "")
+    if not match:
+        return value or ""
+    hours, minutes, seconds = (int(x or 0) for x in match.groups())
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _oembed_info(video_id: str):
+    """Title/channel without any API key (works from cloud servers too)."""
+    try:
+        url = (
+            "https://www.youtube.com/oembed?url="
+            f"https://www.youtube.com/watch?v={video_id}&format=json"
+        )
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        return data.get("title"), data.get("author_name")
+    except Exception:
+        return None, None
 
 
 def get_video_info(video_id: str) -> dict:
     thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
-    if not YOUTUBE_API_KEY:
-        return {
-            "video_id": video_id,
-            "title": "YouTube Video",
-            "channel": "Unknown",
-            "description": "",
-            "thumbnail": thumbnail,
-            "duration": "Unknown",
-            "default_audio_language": None,
-        }
-
-    youtube = build(
-        "youtube",
-        "v3",
-        developerKey=YOUTUBE_API_KEY,
-        cache_discovery=False
-    )
-
-    response = youtube.videos().list(
-        part="snippet,contentDetails",
-        id=video_id
-    ).execute()
-
-    items = response.get("items", [])
-
-    if not items:
-        raise ValueError("Video not found or unavailable.")
-
-    video = items[0]
-    snippet = video["snippet"]
-
-    return {
+    info = {
         "video_id": video_id,
-        "title": snippet["title"],
-        "channel": snippet["channelTitle"],
-        "description": snippet.get("description", ""),
-        "thumbnail": snippet.get("thumbnails", {}).get("high", {}).get("url", thumbnail),
-        "duration": video["contentDetails"]["duration"],
-        "default_audio_language": (
-            snippet.get("defaultAudioLanguage")
-            or snippet.get("defaultLanguage")
-        ),
+        "title": "YouTube Video",
+        "channel": "Unknown",
+        "description": "",
+        "thumbnail": thumbnail,
+        "duration": "",
+        "default_audio_language": None,
     }
 
+    if YOUTUBE_API_KEY:
+        try:
+            youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
+            response = youtube.videos().list(
+                part="snippet,contentDetails", id=video_id
+            ).execute()
+
+            items = response.get("items", [])
+            if items:
+                snippet = items[0]["snippet"]
+                info.update({
+                    "title": snippet["title"],
+                    "channel": snippet["channelTitle"],
+                    "description": snippet.get("description", ""),
+                    "thumbnail": snippet.get("thumbnails", {}).get("high", {}).get("url", thumbnail),
+                    "duration": format_iso_duration(items[0]["contentDetails"]["duration"]),
+                    "default_audio_language": (
+                        snippet.get("defaultAudioLanguage") or snippet.get("defaultLanguage")
+                    ),
+                })
+                return info
+        except Exception as exc:
+            print("YouTube Data API failed, using oEmbed:", repr(exc))
+
+    title, channel = _oembed_info(video_id)
+    if title:
+        info["title"] = title
+    if channel:
+        info["channel"] = channel
+
+    return info
+
 
 # =========================================================
-# TRANSCRIPT EXTRACTION
+# STEP 1: YOUTUBE CAPTIONS (may be blocked on cloud servers)
 # =========================================================
 
-def extract_transcript(video_id: str, preferred_language=None) -> dict:
+def fetch_captions(video_id: str, preferred_language=None) -> dict:
     api = YouTubeTranscriptApi()
     transcript_list = list(api.list(video_id))
 
@@ -242,12 +246,10 @@ def extract_transcript(video_id: str, preferred_language=None) -> dict:
 
     if preferred_language:
         base = preferred_language.lower().split("-")[0]
-
         matching = [
             item for item in transcript_list
             if item.language_code.lower().split("-")[0] == base
         ]
-
         if matching:
             manual = [item for item in matching if not item.is_generated]
             selected = manual[0] if manual else matching[0]
@@ -258,548 +260,452 @@ def extract_transcript(video_id: str, preferred_language=None) -> dict:
 
     fetched = selected.fetch()
 
-    segments = []
+    lines = []
+    block_start = None
+    block_text = []
 
     for item in fetched:
-        text = item.text.strip()
+        piece = (item.text or "").strip().replace("\n", " ")
+        if not piece:
+            continue
 
-        if text:
-            segments.append({
-                "timestamp": format_timestamp(item.start),
-                "start": float(item.start),
-                "text": text,
-            })
+        start = float(item.start)
 
-    if not segments:
+        if block_start is None:
+            block_start = start
+        elif start - block_start >= 25:
+            lines.append(f"[{format_timestamp(block_start)}] {' '.join(block_text)}")
+            block_start = start
+            block_text = []
+
+        block_text.append(piece)
+
+    if block_text:
+        lines.append(f"[{format_timestamp(block_start)}] {' '.join(block_text)}")
+
+    text = "\n".join(lines)
+
+    if not text.strip():
         raise ValueError("Transcript is empty.")
 
-    return {
-        "language": selected.language,
-        "language_code": selected.language_code,
-        "is_generated": selected.is_generated,
-        "segments": segments,
-    }
+    return {"text": text, "language": selected.language}
 
 
 # =========================================================
-# LOCAL VIDEO DOWNLOAD + OCR
+# STEP 2: GEMINI WATCHES THE YOUTUBE LINK (no captions needed)
 # =========================================================
 
-def download_video_for_ocr(video_url: str, output_dir: str) -> str:
-    """
-    Downloads one progressive video stream for local frame OCR.
-    It prefers MP4 up to 360p to reduce download size.
-    yt-dlp may need updating if YouTube changes its delivery.
-    """
+VIDEO_NOTES_PROMPT = """
+You are preparing complete study material from this YouTube video so that a
+chatbot can later clear a student's doubts about it.
 
-    options = {
-        "format": (
-            "best[height<=360][ext=mp4][vcodec!=none][acodec!=none]"
-            "/best[height<=360][vcodec!=none][acodec!=none]"
-            "/best[ext=mp4][vcodec!=none][acodec!=none]/best"
-        ),
-        "outtmpl": os.path.join(output_dir, "source_video.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 2,
-        "fragment_retries": 2,
-        "socket_timeout": 30,
-    }
+Watch and listen to the ENTIRE video, then write detailed, faithful notes.
 
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-
-        requested = info.get("requested_downloads") or []
-
-        if requested and requested[0].get("filepath"):
-            candidate = requested[0]["filepath"]
-            if os.path.exists(candidate):
-                return candidate
-
-        candidate = ydl.prepare_filename(info)
-
-        if os.path.exists(candidate):
-            return candidate
-
-    # Fallback: find the downloaded media file in the temporary directory.
-    for path in Path(output_dir).iterdir():
-        if path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
-            return str(path)
-
-    raise RuntimeError(
-        "yt-dlp finished but the downloaded video file was not found."
-    )
+RULES:
+- Cover EVERY topic, definition, explanation, example, analogy, step, formula,
+  code snippet, number, comparison and conclusion, in the order presented.
+- Also include important text shown on screen or on slides.
+- Write full explanatory sentences (not just keywords), so each part makes
+  sense on its own.
+- Keep the video's own language (Hindi in Devanagari, Hinglish in Roman
+  script, or English). Keep technical terms as they are.
+- Organize with '## [MM:SS] Topic name' headings.
+- TIMESTAMPS ARE REQUIRED: start every heading and every paragraph with the
+  real video playback time where that part is discussed, in the exact form
+  [MM:SS] (use [H:MM:SS] after the first hour), for example [05:32]. Put each
+  paragraph on its own line. Use only times that really occur in the video.
+- Do not add outside information. Do not invent anything.
+- Skip greetings, sponsor messages and filler.
+"""
 
 
-def _available_ocr_languages():
-    try:
-        langs = set(pytesseract.get_languages(config=""))
-
-        if "eng" in langs and "hin" in langs:
-            return "eng+hin"
-        if "eng" in langs:
-            return "eng"
-        if "hin" in langs:
-            return "hin"
-
-        return "eng"
-    except Exception:
-        return "eng"
-
-
-def preprocess_frame(frame):
-    height, width = frame.shape[:2]
-
-    if width > OCR_MAX_WIDTH:
-        scale = OCR_MAX_WIDTH / width
-        frame = cv2.resize(
-            frame,
-            (int(width * scale), int(height * scale)),
-            interpolation=cv2.INTER_CUBIC
+def gemini_video_to_text(video_id: str) -> str:
+    if gemini_client is None:
+        raise ValueError(
+            "YouTube ne captions nahi diye aur GEMINI_API_KEY set nahi hai."
         )
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    gray = cv2.resize(
-        gray,
-        None,
-        fx=1.5,
-        fy=1.5,
-        interpolation=cv2.INTER_CUBIC
-    )
+    config_kwargs = {"temperature": 0.2}
 
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    # Lower frame resolution = far fewer tokens for long videos.
+    media_resolution = getattr(types, "MediaResolution", None)
+    if media_resolution is not None and hasattr(media_resolution, "MEDIA_RESOLUTION_LOW"):
+        config_kwargs["media_resolution"] = media_resolution.MEDIA_RESOLUTION_LOW
 
-    # Otsu threshold often improves projected slide text.
-    _, threshold = cv2.threshold(
-        gray,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    return threshold
-
-
-def extract_slide_text(video_path: str, interval_seconds=None) -> list:
-    """
-    Samples a frame every N seconds and extracts visible slide text.
-    Returns OCR records with video timestamps.
-    """
-
-    interval = interval_seconds or OCR_INTERVAL_SECONDS
-
-    if interval < 5:
-        interval = 5
-
-    capture = cv2.VideoCapture(video_path)
-
-    if not capture.isOpened():
-        raise RuntimeError("OpenCV could not open the downloaded video.")
-
-    fps = capture.get(cv2.CAP_PROP_FPS) or 0
-    frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0
-    duration = frame_count / fps if fps > 0 else 0
-
-    if duration <= 0:
-        capture.release()
-        raise RuntimeError("Could not determine video duration for OCR.")
-
-    ocr_lang = _available_ocr_languages()
-
-    records = []
-    previous_normalized = ""
-
-    print(
-        f"Running local OCR every {interval}s "
-        f"(duration: {format_timestamp(duration)}, lang: {ocr_lang})..."
-    )
-
-    second = 0.0
-
-    while second < duration:
-        capture.set(cv2.CAP_PROP_POS_MSEC, second * 1000)
-        ok, frame = capture.read()
-
-        if ok and frame is not None:
-            processed = preprocess_frame(frame)
-
-            try:
-                text = pytesseract.image_to_string(
-                    processed,
-                    lang=ocr_lang,
-                    config="--oem 3 --psm 6"
-                )
-            except Exception as exc:
-                capture.release()
-                raise RuntimeError(
-                    "Tesseract OCR failed. Check Tesseract installation "
-                    f"and language data. Details: {exc}"
-                )
-
-            # Normalize OCR output and remove empty/noisy frames.
-            lines = [
-                re.sub(r"\s+", " ", line).strip()
-                for line in text.splitlines()
-            ]
-
-            cleaned = "\n".join(line for line in lines if len(line) >= 2)
-            normalized = re.sub(r"\W+", "", cleaned.lower())
-
-            # Avoid indexing identical consecutive slide frames.
-            if (
-                cleaned
-                and len(normalized) >= 8
-                and normalized != previous_normalized
-            ):
-                records.append({
-                    "timestamp": format_timestamp(second),
-                    "start": float(second),
-                    "text": cleaned,
-                })
-
-                previous_normalized = normalized
-
-            # Release large frame arrays before decoding the next frame.
-            del processed
-            del frame
-
-        second += interval
-
-    capture.release()
-
-    print(f"OCR extracted text from {len(records)} distinct frames.")
-
-    return records
-
-
-def extract_video_frames_ocr(video_url: str) -> list:
-    """
-    Uses a temporary directory. The downloaded video is deleted afterwards.
-    OCR failure is non-fatal: transcript RAG can still work.
-    """
-
-    temp_dir = tempfile.mkdtemp(prefix="yt_chatbot_ocr_")
+    print(f"Asking Gemini ({GEMINI_MODEL}) to read the YouTube video...")
 
     try:
-        video_path = download_video_for_ocr(video_url, temp_dir)
-        return extract_slide_text(video_path)
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=types.Content(parts=[
+                types.Part(file_data=types.FileData(file_uri=video_url)),
+                types.Part(text=VIDEO_NOTES_PROMPT),
+            ]),
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        print("Gemini video error:", repr(exc))
+
+        if "getaddrinfo" in message or "11001" in message or "connecterror" in message \
+                or "connection" in message or "timed out" in message:
+            raise ValueError(
+                "Internet/DNS problem: Gemini server tak request nahi pahunch paayi. "
+                "Internet check karo (DNS 8.8.8.8, VPN band) ya Render par chalao."
+            )
+        if "429" in message or "quota" in message or "resource_exhausted" in message:
+            raise ValueError(
+                "Gemini ki free limit abhi poori ho gayi hai. Thodi der baad try karo."
+            )
+        if "404" in message and "model" in message:
+            raise ValueError(
+                "Gemini model naam galat/purana hai. Render me GEMINI_MODEL "
+                "environment variable me current model naam daalo."
+            )
+        if (
+            "private" in message
+            or "permission" in message
+            or "not found" in message
+            or "invalid_argument" in message
+            or "400" in message
+        ):
+            raise ValueError(
+                "Yeh video Gemini process nahi kar paya. Video public hona "
+                "chahiye (private/unlisted/age-restricted nahi)."
+            )
+        raise ValueError(f"Gemini video processing failed: {exc}")
+
+    text = (getattr(response, "text", None) or "").strip()
+
+    if len(text) < 200:
+        raise ValueError("Gemini ko is video se kaafi content nahi mila.")
+
+    return text
+
+
+# =========================================================
+# CHUNKING + EMBEDDINGS + SEARCH (no local ML model)
+# =========================================================
+
+_MARKER = re.compile(r"\[(?:\d{1,2}:)?\d{1,2}:\d{2}\]")
+_STARTS_WITH_MARKER = re.compile(r"\s*(?:#+\s*)?\[(?:\d{1,2}:)?\d{1,2}:\d{2}\]")
+
+
+def _last_marker(text: str):
+    found = _MARKER.findall(text)
+    return found[-1] if found else None
+
+
+def split_into_chunks(text: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> list:
+    """Split text into chunks. Every chunk begins with a [MM:SS] time marker
+    (carried over from the previous chunk when needed) so answers can say
+    when a topic was discussed."""
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    parts = re.split(r"(?<=[.!?।])\s+|\n+", text)
+
+    units = []
+    for part in parts:
+        part = part.strip()
+        while len(part) > size:
+            cut = part.rfind(" ", 0, size)
+            if cut < size // 2:
+                cut = size
+            units.append(part[:cut].strip())
+            part = part[cut:].strip()
+        if part:
+            units.append(part)
+
+    chunks = []
+    current = ""
+    carried = None
+
+    for unit in units:
+        if current and len(current) + len(unit) + 1 > size:
+            chunks.append(current)
+            carried = _last_marker(current) or carried
+
+            tail = current[-overlap:] if overlap else ""
+            if " " in tail:
+                tail = tail[tail.find(" ") + 1:]
+
+            current = (tail + " " + unit).strip()
+
+            if carried and not _STARTS_WITH_MARKER.match(current):
+                current = f"{carried} {current}"
+        else:
+            current = (current + " " + unit).strip()
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def embed_texts(texts: list, task_type: str) -> np.ndarray:
+    if gemini_client is None:
+        raise RuntimeError("Gemini client not configured.")
+
+    vectors = []
+    batch_size = 50
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+
+        for attempt in range(3):
+            try:
+                response = gemini_client.models.embed_content(
+                    model=EMBED_MODEL,
+                    contents=batch,
+                    config=types.EmbedContentConfig(task_type=task_type),
+                )
+                vectors.extend([item.values for item in response.embeddings])
+                break
+            except Exception as exc:
+                message = str(exc).lower()
+                is_rate_limit = "429" in message or "quota" in message or "resource_exhausted" in message
+                if attempt == 2 or not is_rate_limit:
+                    raise
+                time.sleep(20 * (attempt + 1))
+
+    array = np.array(vectors, dtype="float32")
+    norms = np.linalg.norm(array, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return array / norms
+
+
+def _tokenize(text: str) -> set:
+    return {t for t in re.split(r"[\s,.;:!?()\[\]\"'।|/\\-]+", text.lower()) if len(t) > 1}
+
+
+def _lexical_scores(query: str, chunks: list) -> np.ndarray:
+    query_tokens = _tokenize(query)
+    if not query_tokens:
+        return np.zeros(len(chunks), dtype="float32")
+
+    return np.array(
+        [len(query_tokens & _tokenize(chunk)) / len(query_tokens) for chunk in chunks],
+        dtype="float32",
+    )
+
+
+def search_chunks(video_data: dict, query: str, k=TOP_K) -> list:
+    chunks = video_data["chunks"]
+    embeddings = video_data.get("embeddings")
+
+    scores = None
+
+    if embeddings is not None:
+        try:
+            query_vector = embed_texts([query], "RETRIEVAL_QUERY")[0]
+            scores = embeddings @ query_vector
+        except Exception as exc:
+            print("Embedding search failed, using keyword search:", repr(exc))
+
+    if scores is None:
+        scores = _lexical_scores(query, chunks)
+
+    top = np.argsort(-scores)[:k]
+
+    # Keep the video's natural order so explanations read in sequence.
+    return [chunks[i] for i in sorted(top.tolist())]
+
+
+# =========================================================
+# STORAGE (memory cache + disk)
+# =========================================================
+
+def _remember(video_id: str, data: dict):
+    VIDEO_CACHE[video_id] = data
+    VIDEO_CACHE.move_to_end(video_id)
+
+    while len(VIDEO_CACHE) > MAX_CACHED_VIDEOS:
+        VIDEO_CACHE.popitem(last=False)
         gc.collect()
 
 
-# =========================================================
-# HYBRID FAISS INDEX: TRANSCRIPT + SLIDE OCR
-# =========================================================
-
-def create_hybrid_vector_store(
-    video_id: str,
-    transcript_segments: list,
-    ocr_segments: list,
-    language_code: str,
-):
-    safe_language = re.sub(
-        r"[^a-zA-Z0-9_-]",
-        "_",
-        language_code or "unknown"
+def _paths(video_id: str):
+    return (
+        os.path.join(DATA_DIR, f"{video_id}.json"),
+        os.path.join(DATA_DIR, f"{video_id}.npy"),
     )
 
-    # Versioned folder prevents loading old transcript-only indexes.
-    index_folder = os.path.join(
-        INDEX_DIR,
-        f"{video_id}_{safe_language}_hybrid_ocr_v1"
-    )
 
-    index_file = os.path.join(index_folder, "index.faiss")
-    metadata_file = os.path.join(index_folder, "index.pkl")
+def _save_to_disk(video_id: str, data: dict):
+    json_path, npy_path = _paths(video_id)
+    try:
+        with open(json_path, "w", encoding="utf-8") as file:
+            json.dump({
+                "version": 2,
+                "video": data["video"],
+                "source": data["source"],
+                "language": data["language"],
+                "notes": data["notes"],
+                "chunks": data["chunks"],
+            }, file, ensure_ascii=False)
 
-    if os.path.isfile(index_file) and os.path.isfile(metadata_file):
-        print("Loading existing Hybrid RAG FAISS index...")
+        if data.get("embeddings") is not None:
+            np.save(npy_path, data["embeddings"])
+        elif os.path.isfile(npy_path):
+            os.remove(npy_path)
+    except Exception as exc:
+        print("Could not save video data to disk:", repr(exc))
 
-        return FAISS.load_local(
-            index_folder,
-            get_embeddings(),
-            allow_dangerous_deserialization=True,
-        )
 
-    documents = []
+def _load_from_disk(video_id: str):
+    json_path, npy_path = _paths(video_id)
 
-    # Transcript documents grouped into approximately 30-second chunks.
-    chunk = []
-    chunk_start = None
-    chunk_end = None
-    chunk_chars = 0
+    if not os.path.isfile(json_path):
+        return None
 
-    def save_transcript_chunk():
-        nonlocal chunk, chunk_start, chunk_end, chunk_chars
+    try:
+        with open(json_path, "r", encoding="utf-8") as file:
+            saved = json.load(file)
 
-        if not chunk:
-            return
+        if saved.get("version") != 2:
+            return None
 
-        start_label = format_timestamp(chunk_start)
-        end_label = format_timestamp(chunk_end)
+        embeddings = np.load(npy_path) if os.path.isfile(npy_path) else None
 
-        body = "\n".join(
-            f"[{item['timestamp']}] {item['text']}" for item in chunk
-        )
+        if embeddings is not None and len(embeddings) != len(saved["chunks"]):
+            embeddings = None
 
-        documents.append(Document(
-            page_content=(
-                f"SOURCE: VIDEO TRANSCRIPT\n"
-                f"VIDEO TIME: {start_label} - {end_label}\n{body}"
-            ),
-            metadata={
-                "video_id": video_id,
-                "source": "transcript",
-                "timestamp": start_label,
-                "end_timestamp": end_label,
-                "start": float(chunk_start),
-                "language_code": language_code or "unknown",
-            },
-        ))
+        saved["embeddings"] = embeddings
+        return saved
+    except Exception as exc:
+        print("Could not read saved video data:", repr(exc))
+        return None
 
-        chunk = []
-        chunk_start = None
-        chunk_end = None
-        chunk_chars = 0
 
-    for item in transcript_segments:
-        text = str(item.get("text", "")).strip()
+def build_index(video_id: str, info: dict, text: str, source: str, language: str) -> dict:
+    chunks = split_into_chunks(text)
 
-        if not text:
-            continue
+    if not chunks:
+        raise ValueError("Is video se koi text nahi nikla.")
 
-        current = float(item.get("start", 0))
+    embeddings = None
 
-        if chunk and (
-            current - chunk_start >= 30
-            or chunk_chars + len(text) > 1200
-        ):
-            save_transcript_chunk()
+    if gemini_client is not None:
+        try:
+            embeddings = embed_texts(chunks, "RETRIEVAL_DOCUMENT")
+        except Exception as exc:
+            print("Embedding failed, keyword search will be used:", repr(exc))
 
-        if chunk_start is None:
-            chunk_start = current
+    data = {
+        "video": info,
+        "source": source,
+        "language": language,
+        "notes": text,
+        "chunks": chunks,
+        "embeddings": embeddings,
+    }
 
-        chunk_end = current
-        chunk.append(item)
-        chunk_chars += len(text)
+    _save_to_disk(video_id, data)
+    _remember(video_id, data)
 
-    save_transcript_chunk()
+    print(f"Indexed {len(chunks)} chunks (source: {source}, embeddings: {embeddings is not None}).")
 
-    # OCR documents: one document per distinct slide/frame.
-    for item in ocr_segments:
-        text = str(item.get("text", "")).strip()
-
-        if not text:
-            continue
-
-        timestamp = item.get("timestamp", "Unknown")
-        start = float(item.get("start", 0))
-
-        documents.append(Document(
-            page_content=(
-                "SOURCE: VIDEO SLIDE / ON-SCREEN TEXT (OCR)\n"
-                f"VIDEO TIMESTAMP: {timestamp}\n"
-                "TEXT READ FROM THE VIDEO FRAME:\n"
-                f"{text}"
-            ),
-            metadata={
-                "video_id": video_id,
-                "source": "slide_ocr",
-                "timestamp": timestamp,
-                "end_timestamp": timestamp,
-                "start": start,
-                "language_code": language_code or "unknown",
-            },
-        ))
-
-    if not documents:
-        raise ValueError(
-            "No searchable content was extracted from transcript or video frames."
-        )
-
-    print(
-        f"Creating Hybrid FAISS index: "
-        f"{len(transcript_segments)} transcript segments, "
-        f"{len(ocr_segments)} OCR frames, {len(documents)} documents."
-    )
-
-    vector_store = FAISS.from_documents(
-        documents=documents,
-        embedding=get_embeddings(),
-    )
-
-    os.makedirs(index_folder, exist_ok=True)
-    vector_store.save_local(index_folder)
-
-    print("Hybrid RAG FAISS index saved successfully.")
-
-    return vector_store
+    return data
 
 
 # =========================================================
-# LOAD VIDEO
+# LOAD VIDEO (only the link is needed)
 # =========================================================
 
 def load_video(video_url: str) -> dict:
     video_id = extract_video_id(video_url)
 
     if video_id in VIDEO_CACHE:
-        print("Video found in memory cache.")
         VIDEO_CACHE.move_to_end(video_id)
         return VIDEO_CACHE[video_id]
 
-    print("Fetching YouTube video information...")
-    video_info = get_video_info(video_id)
+    saved = _load_from_disk(video_id)
+    if saved:
+        print("Loaded video from disk.")
+        _remember(video_id, saved)
+        return saved
 
-    # Transcript is attempted first, but OCR can still work when captions
-    # are unavailable.
-    transcript_data = {
-        "language": "Unavailable",
-        "language_code": "unknown",
-        "is_generated": False,
-        "segments": [],
-    }
+    info = get_video_info(video_id)
 
+    text = None
+    source = None
+    language = "Unknown"
+
+    # Try 1: YouTube captions.
     try:
-        print("Extracting YouTube transcript...")
-
-        transcript_data = extract_transcript(
-            video_id,
-            video_info.get("default_audio_language"),
-        )
-
-        print(
-            f"Transcript extracted: {len(transcript_data['segments'])} "
-            f"segments ({transcript_data['language']})."
-        )
-
+        print("Trying YouTube captions...")
+        captions = fetch_captions(video_id, info.get("default_audio_language"))
+        if len(captions["text"]) >= 200:
+            text = captions["text"]
+            language = captions["language"]
+            source = "captions"
     except Exception as exc:
-        print(f"Transcript extraction unavailable: {exc}")
+        print(f"Captions unavailable: {exc}")
 
-    # OCR is optional and non-fatal. It runs only when ENABLE_OCR=true.
-    ocr_segments = []
-    ocr_error = None
+    # Try 2: Gemini reads the video directly from the YouTube link.
+    if text is None:
+        text = gemini_video_to_text(video_id)
+        source = "gemini"
 
-    if ENABLE_OCR:
-        try:
-            print("Downloading video temporarily for local slide OCR...")
-            ocr_segments = extract_video_frames_ocr(video_url)
-        except Exception as exc:
-            ocr_error = str(exc)
-            print("Local OCR skipped/failed:", ocr_error)
-    else:
-        ocr_error = "OCR disabled on server."
+    return build_index(video_id, info, text, source, language)
 
-    vector_store = create_hybrid_vector_store(
-        video_id=video_id,
-        transcript_segments=transcript_data["segments"],
-        ocr_segments=ocr_segments,
-        language_code=transcript_data["language_code"],
-    )
 
-    video_data = {
-        "video": video_info,
-        "segments": transcript_data["segments"],
-        "transcript_language": transcript_data["language"],
-        "transcript_language_code": transcript_data["language_code"],
-        "transcript_is_generated": transcript_data["is_generated"],
-        "ocr_segments": ocr_segments,
-        "ocr_error": ocr_error,
-        "vector_store": vector_store,
-    }
+def ensure_loaded(video_id: str, video_url=None) -> dict:
+    """Return loaded video data; transparently reload after a server restart."""
+    if video_id in VIDEO_CACHE:
+        VIDEO_CACHE.move_to_end(video_id)
+        return VIDEO_CACHE[video_id]
 
-    VIDEO_CACHE[video_id] = video_data
-    VIDEO_CACHE.move_to_end(video_id)
+    saved = _load_from_disk(video_id)
+    if saved:
+        _remember(video_id, saved)
+        return saved
 
-    # Avoid retaining multiple large FAISS stores in a 512 MB instance.
-    while len(VIDEO_CACHE) > MAX_CACHED_VIDEOS:
-        old_video_id, old_video_data = VIDEO_CACHE.popitem(last=False)
-        del old_video_data
-        print(f"Removed old video {old_video_id} from memory cache.")
-        gc.collect()
+    if video_url and extract_video_id(video_url) == video_id:
+        return load_video(video_url)
 
-    print("Video loaded successfully with Hybrid RAG.")
-
-    return video_data
+    raise ValueError("Video is not loaded. Please load it again.")
 
 
 # =========================================================
-# LANGUAGE VALIDATION
+# CHAT WITH VIDEO (RAG)
 # =========================================================
 
-def validate_language(language: str) -> str:
-    if language not in SUPPORTED_LANGUAGES:
-        raise ValueError("Choose English, Hindi or Hinglish.")
+CHAT_PROMPT = ChatPromptTemplate.from_template("""
+You are a patient, friendly tutor helping a student clear doubts about ONE
+YouTube video titled "{title}".
 
-    return language
+You are given VIDEO CONTENT (the most relevant parts of the video) and the
+recent CHAT HISTORY.
 
-
-# =========================================================
-# CHAT WITH VIDEO: HYBRID RETRIEVAL
-# =========================================================
-
-def ask_question(video_id: str, question: str, language="English") -> str:
-    language = validate_language(language)
-
-    if not question or not question.strip():
-        raise ValueError("Question cannot be empty.")
-
-    if video_id not in VIDEO_CACHE:
-        raise ValueError("Video is not loaded. Please load it again.")
-
-    vector_store = VIDEO_CACHE[video_id]["vector_store"]
-
-    # Retrieve from one combined index containing transcript + OCR.
-    relevant_docs = vector_store.similarity_search(
-        question.strip(),
-        k=10,
-    )
-
-    if not relevant_docs:
-        raise ValueError("No relevant video content found.")
-
-    context_parts = []
-
-    for doc in relevant_docs:
-        source = doc.metadata.get("source", "video")
-        timestamp = doc.metadata.get("timestamp", "Unknown")
-        end_timestamp = doc.metadata.get("end_timestamp", timestamp)
-
-        source_label = (
-            "Transcript" if source == "transcript"
-            else "Slide / on-screen OCR"
-        )
-
-        context_parts.append(
-            f"[Source: {source_label} | Video time: {timestamp} - {end_timestamp}]\n"
-            f"{doc.page_content}"
-        )
-
-    context = "\n\n---\n\n".join(context_parts)
-
-    prompt = ChatPromptTemplate.from_template("""
-You are an accurate YouTube video tutor using Hybrid RAG.
-
-The retrieved context can contain:
-1. Spoken video transcript.
-2. Text read from presentation slides or other video frames using OCR.
-
-RULES:
-- Answer the user's actual question directly.
-- Use only the supplied context as evidence about this video.
-- Combine transcript and OCR evidence when both are relevant.
-- OCR may contain recognition mistakes. If text is unclear, say so.
-- Do not invent facts, definitions, examples, or timestamps.
-- A topic heading alone is not enough to claim its full definition.
-- If the context does not contain the requested information, clearly say
-  that the available transcript/slide text does not provide it.
-- Mention whether evidence came from spoken transcript or slide text
-  when useful.
-- Include timestamps only when present in the retrieved context.
-- Use simple, clear language.
+HOW TO ANSWER:
+1. Answer the actual question directly first, in one or two lines.
+2. Then explain clearly, step by step, like a good teacher: simple words,
+   short paragraphs, bullets or numbered steps where they help. Reuse the
+   video's own examples and analogies.
+3. Base the answer on the VIDEO CONTENT. Never invent things the video did
+   not say and never claim the video said something it did not.
+4. If the video covers the doubt only partly, explain the covered part and
+   then add a short, clearly labelled extra section (in the response
+   language) saying it is extra information from outside the video. If the
+   video does not cover the doubt at all, say so clearly and then give a
+   short, accurate explanation under the same kind of label.
+5. Use CHAT HISTORY to understand follow-up questions (what "it", "this",
+   "uska", "isme" refer to).
+6. Be precise with definitions, formulas and steps. For a long answer, end
+   with a one-line recap.
+7. Do not mention "context", "chunks" or "retrieval". Say "video me" /
+   "in the video" instead.
+8. TIMESTAMPS: the VIDEO CONTENT has time markers like [05:32] showing where
+   each part is in the video. Tell the student WHEN the topic was discussed,
+   e.g. "Yeh video me [05:32] par samjhaya gaya hai". Write every time
+   exactly as [MM:SS] (or [H:MM:SS]) and use ONLY markers that appear in the
+   VIDEO CONTENT; never guess or invent a time. Mention the 1-3 most
+   relevant times and finish with a line like "Video me dekhein: [05:32],
+   [07:10]" (translated to the response language). Extra information from
+   outside the video gets no timestamp. If the content has no time markers,
+   do not mention any time.
 
 RESPONSE LANGUAGE:
 English: natural English.
@@ -809,21 +715,64 @@ Keep technical terms in their original form where appropriate.
 
 Selected response language: {language}
 
-RETRIEVED VIDEO CONTEXT:
+CHAT HISTORY:
+{history}
+
+VIDEO CONTENT:
 {context}
 
-USER QUESTION:
+STUDENT'S QUESTION:
 {question}
 
-Give a useful, accurate answer.
+Give a clear, helpful answer that actually clears the doubt.
 """)
 
-    chain = prompt | llm | StrOutputParser()
+
+def _format_history(history) -> str:
+    if not history:
+        return "(no earlier messages)"
+
+    lines = []
+    for item in history[-6:]:
+        role = "Student" if item.get("role") == "user" else "Tutor"
+        content = str(item.get("content", "")).strip().replace("\n", " ")
+        lines.append(f"{role}: {content[:600]}")
+
+    return "\n".join(lines)
+
+
+def ask_question(video_id: str, question: str, language="English",
+                 video_url=None, history=None) -> str:
+    language = validate_language(language)
+
+    if not question or not question.strip():
+        raise ValueError("Question cannot be empty.")
+
+    question = question.strip()
+    data = ensure_loaded(video_id, video_url)
+
+    # Short follow-ups ("explain more") retrieve better with the previous question.
+    search_query = question
+    if history and len(question) < 50:
+        previous = [h for h in history if h.get("role") == "user"]
+        if previous:
+            search_query = f"{previous[-1].get('content', '')} {question}"
+
+    relevant = search_chunks(data, search_query, k=TOP_K)
+
+    if not relevant:
+        raise ValueError("No relevant video content found.")
+
+    context = "\n\n---\n\n".join(relevant)
+
+    chain = CHAT_PROMPT | llm | StrOutputParser()
 
     return chain.invoke({
-        "context": context,
-        "question": question.strip(),
+        "title": data["video"].get("title", "YouTube Video"),
         "language": language,
+        "history": _format_history(history),
+        "context": context,
+        "question": question,
     })
 
 
@@ -831,50 +780,14 @@ Give a useful, accurate answer.
 # SUMMARY
 # =========================================================
 
-def generate_summary(video_id: str, language="English") -> str:
-    """
-    Generate a structured, point-wise summary from the complete available
-    transcript and slide OCR. Long videos are summarized in chunks so that
-    the middle of the video is not silently discarded.
-    """
-
+def generate_summary(video_id: str, language="English", video_url=None) -> str:
     language = validate_language(language)
 
-    if video_id not in VIDEO_CACHE:
-        raise ValueError("Video is not loaded. Please load it first.")
-
-    video_data = VIDEO_CACHE[video_id]
-
-    transcript_segments = video_data.get("segments", [])
-    ocr_segments = video_data.get("ocr_segments", [])
-
-    # Merge transcript and OCR records in video-time order.
-    timed_pieces = []
-
-    for item in transcript_segments:
-        text = str(item.get("text", "")).strip()
-
-        if text:
-            timed_pieces.append((
-                float(item.get("start", 0)),
-                f"[{item.get('timestamp', 'Unknown')}] [Transcript] {text}"
-            ))
-
-    for item in ocr_segments:
-        text = str(item.get("text", "")).strip()
-
-        if text:
-            timed_pieces.append((
-                float(item.get("start", 0)),
-                f"[{item.get('timestamp', 'Unknown')}] [Slide OCR] {text}"
-            ))
-
-    timed_pieces.sort(key=lambda item: item[0])
-
-    combined = "\n".join(piece for _, piece in timed_pieces)
+    data = ensure_loaded(video_id, video_url)
+    combined = (data.get("notes") or "").strip()
 
     if not combined:
-        raise ValueError("No transcript or slide text is available to summarize.")
+        raise ValueError("No text is available to summarize.")
 
     language_instruction = """
     English: natural, simple English.
@@ -883,18 +796,11 @@ def generate_summary(video_id: str, language="English") -> str:
     Keep technical terms in their original form where appropriate.
     """
 
-    # Chunking preserves coverage of long videos instead of selecting only
-    # the beginning, middle and ending portions.
     chunk_size = 4000
+    pieces = [combined[i:i + chunk_size] for i in range(0, len(combined), chunk_size)]
 
-    chunks = [
-        combined[index:index + chunk_size]
-        for index in range(0, len(combined), chunk_size)
-    ]
-
-    if len(chunks) == 1:
-        source_content = chunks[0]
-
+    if len(pieces) == 1:
+        source_content = pieces[0]
     else:
         chunk_prompt = ChatPromptTemplate.from_template("""
 You are extracting accurate study notes from one section of a YouTube video.
@@ -902,8 +808,8 @@ You are extracting accurate study notes from one section of a YouTube video.
 Write concise bullet-point notes in {language}.
 
 - Keep important concepts, definitions, examples, steps and components.
-- Preserve exact timestamps shown in the source.
 - Do not invent information or add facts from outside knowledge.
+- Keep the [MM:SS] time markers next to the points they belong to.
 - Do not write an introduction or conclusion.
 - Use headings and bullets, not tables.
 - This is only one section; do not imply it represents the whole video.
@@ -914,17 +820,15 @@ SOURCE SECTION:
 
         chunk_chain = chunk_prompt | summary_llm | StrOutputParser()
 
-        chunk_notes = []
-
-        for index, chunk_text in enumerate(chunks, start=1):
+        notes_list = []
+        for index, piece in enumerate(pieces, start=1):
             notes = invoke_summary_with_retry(chunk_chain, {
-                "content": chunk_text,
+                "content": piece,
                 "language": language,
             })
+            notes_list.append(f"VIDEO SECTION {index} NOTES:\n{notes}")
 
-            chunk_notes.append(f"VIDEO SECTION {index} NOTES:\n{notes}")
-
-        source_content = "\n\n".join(chunk_notes)
+        source_content = "\n\n".join(notes_list)
 
     final_prompt = ChatPromptTemplate.from_template("""
 You are a professional YouTube video summarizer and study-notes creator.
@@ -938,12 +842,10 @@ STRICT FORMATTING RULES:
 - Use short, clear, useful points.
 - Do not output HTML tags such as <br>.
 - Use **bold** only for important terms; do not escape Markdown characters.
-- Use numbered lists for processes, steps, characteristics and components.
-- Include timestamps only when exact timestamps appear in the supplied source.
-- Do not invent timestamps, names, definitions, examples, facts or components.
+- Where the source has [MM:SS] time markers, put the start time like
+  [05:32] in each main topic heading. Never invent times.
+- Do not invent names, definitions, examples, facts or components.
 - Do not repeat the same information in multiple sections.
-- Combine transcript and slide OCR evidence where relevant.
-- Treat unclear OCR cautiously.
 - Summarize only what the supplied source supports.
 
 FOLLOW THIS OUTPUT STRUCTURE:
@@ -953,17 +855,13 @@ FOLLOW THIS OUTPUT STRUCTURE:
 
 ## 2. Main Topics Covered
 - List important topics in the order they appear.
-- Use a short bold topic heading.
-- Add 1-3 concise bullet points under each topic.
-- Include an exact timestamp in the topic heading only when available.
+- Use a short bold topic heading with 1-3 concise bullet points under it.
 
 ## 3. Key Learning Points
-- Give the main concepts as numbered or bulleted points.
-- Explain each point briefly.
+- Give the main concepts as numbered or bulleted points, explained briefly.
 
 ## 4. Important Terms / Components
-- List important terms, components or names mentioned.
-- Explain them briefly only when the source supports the explanation.
+- List important terms or names and explain them briefly.
 
 ## 5. Conclusion
 - Give 2-3 short bullet points.
@@ -973,7 +871,7 @@ LANGUAGE:
 
 Selected response language: {language}
 
-COMPLETE VIDEO NOTES / SOURCE:
+VIDEO NOTES / SOURCE:
 {content}
 """)
 
@@ -986,75 +884,3 @@ COMPLETE VIDEO NOTES / SOURCE:
     })
 
     return summary.strip()
-
-
-# =========================================================
-# MANUAL TRANSCRIPT
-# =========================================================
-
-def add_manual_transcript(video_id: str, transcript: str, language="English") -> dict:
-    """
-    Load user-pasted transcript into the existing Hybrid RAG pipeline.
-    """
-
-    language = validate_language(language)
-
-    if not transcript or not transcript.strip():
-        raise ValueError("Please paste a valid transcript.")
-
-    transcript = transcript.strip()
-
-    # Manual transcript has no reliable timestamps,
-    # so keep it as one segment starting at 00:00.
-    transcript_segments = [
-        {
-            "timestamp": "00:00",
-            "start": 0.0,
-            "text": transcript
-        }
-    ]
-
-    language_codes = {
-        "English": "en",
-        "Hindi": "hi",
-        "Hinglish": "hi"
-    }
-
-    language_code = language_codes[language]
-
-    print("Processing manually provided transcript...")
-
-    video_info = get_video_info(video_id)
-
-    # Manual transcript is indexed with the existing FAISS pipeline.
-    vector_store = create_hybrid_vector_store(
-        video_id=video_id,
-        transcript_segments=transcript_segments,
-        ocr_segments=[],
-        language_code=language_code
-    )
-
-    video_data = {
-        "video": video_info,
-        "segments": transcript_segments,
-        "transcript_language": language,
-        "transcript_language_code": language_code,
-        "transcript_is_generated": False,
-        "ocr_segments": [],
-        "ocr_error": None,
-        "vector_store": vector_store
-    }
-
-    VIDEO_CACHE[video_id] = video_data
-    VIDEO_CACHE.move_to_end(video_id)
-
-    while len(VIDEO_CACHE) > MAX_CACHED_VIDEOS:
-        VIDEO_CACHE.popitem(last=False)
-        gc.collect()
-
-    print("Manual transcript loaded successfully.")
-
-    return {
-        "video": video_info,
-        "transcript_segments": transcript_segments
-    }

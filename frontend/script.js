@@ -17,7 +17,6 @@ const CONFIG = {
     ENDPOINTS: {
         health: "/health",
         loadVideo: "/api/load-video",
-        manualTranscript: "/api/manual-transcript",
         summary: "/api/summary",
         chat: "/api/chat"
     },
@@ -32,6 +31,8 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
     videoId: null,
+    videoUrl: null,
+    history: [],
     player: null,
     busy: false
 };
@@ -320,14 +321,6 @@ function setLoading(isLoading, message = "") {
     }
 }
 
-function setManualTranscriptVisible(visible) {
-    const box = $("manualTranscriptBox");
-    if (box) {
-        box.hidden = !visible;
-    }
-}
-
-
 /* =========================================
    9. LOAD YOUTUBE VIDEO
 ========================================= */
@@ -351,10 +344,9 @@ async function handleLoad(event) {
     }
 
     showFieldError("");
-    setManualTranscriptVisible(false);
     state.videoId = videoId;
 
-    setLoading(true, "Analyzing video and preparing AI features...");
+    setLoading(true, "Video samjha ja raha hai (pehli baar 1-2 minute lag sakte hain)...");
 
     try {
         const data = await apiFetch(CONFIG.ENDPOINTS.loadVideo, {
@@ -370,6 +362,7 @@ async function handleLoad(event) {
         }
 
         state.videoId = data.video_id;
+        state.videoUrl = url;
 
         renderVideo(data.video || {});
 
@@ -406,118 +399,10 @@ async function handleLoad(event) {
     } catch (error) {
         console.error("Video loading error:", error);
 
-        state.videoId = videoId;
-
-        setManualTranscriptVisible(true);
-
-        showFieldError(
-            `${error.message} You can paste the transcript manually below.`
-        );
+        showFieldError(error.message);
 
     } finally {
         setLoading(false);
-    }
-}
-
-
-/* =========================================
-   10. MANUAL TRANSCRIPT SUBMISSION
-========================================= */
-
-async function handleManualTranscript(event) {
-    event.preventDefault();
-
-    const transcript = $("manualTranscriptInput")?.value.trim();
-
-    if (!state.videoId) {
-        toast("Please enter and load a valid YouTube video URL first.", "error");
-        return;
-    }
-
-    if (!transcript || transcript.length < 20) {
-        toast("Please paste a valid transcript (at least 20 characters).", "error");
-        return;
-    }
-
-    const button = $("manualTranscriptBtn");
-
-    if (button) {
-        button.disabled = true;
-        button.textContent = "Processing...";
-    }
-
-    try {
-        const data = await apiFetch(CONFIG.ENDPOINTS.manualTranscript, {
-            method: "POST",
-            body: {
-                video_id: state.videoId,
-                transcript: transcript,
-                language: getSelectedLanguage()
-            }
-        });
-
-        if (data.video) {
-            renderVideo(data.video);
-        } else {
-            renderVideo({
-                title: "YouTube Video",
-                channel: "YouTube",
-                thumbnail: `https://img.youtube.com/vi/${state.videoId}/hqdefault.jpg`
-            });
-        }
-
-        if ($("empty")) {
-            $("empty").hidden = true;
-        }
-
-        if ($("workspace")) {
-            $("workspace").hidden = false;
-        }
-
-        const url =
-            $("urlInput")?.value.trim() ||
-            `https://www.youtube.com/watch?v=${state.videoId}`;
-
-        saveHistory({
-            id: state.videoId,
-            url: url,
-            title: data.video?.title || "YouTube Video",
-            channel: data.video?.channel || "",
-            at: Date.now()
-        });
-
-        setManualTranscriptVisible(false);
-        resetChat();
-
-        if ($("summaryLoading")) {
-            $("summaryLoading").hidden = false;
-        }
-
-        if ($("summaryBody")) {
-            $("summaryBody").hidden = true;
-        }
-
-        if ($("summaryError")) {
-            $("summaryError").hidden = true;
-        }
-
-        const count = Array.isArray(data.transcript_segments)
-            ? data.transcript_segments.length
-            : (data.transcript_segments || 0);
-
-        toast(`Transcript processed successfully (${count} segments).`);
-
-        await loadSummary();
-
-    } catch (error) {
-        console.error("Manual transcript error:", error);
-        toast(error.message, "error");
-
-    } finally {
-        if (button) {
-            button.disabled = false;
-            button.textContent = "Process Transcript";
-        }
     }
 }
 
@@ -639,7 +524,7 @@ function renderSummary(markdown) {
 
     function appendInline(parent, value) {
         const text = String(value || "");
-        const tokenPattern = /(\*\*[^\*]+\*\*|__[^\_]+__|\*[^\*]+\*|_[^\_]+_)/g;
+        const tokenPattern = /(\*\*[^\*]+\*\*|__[^\_]+__|\*[^\*]+\*|_[^\_]+_|\[\d{1,2}(?::\d{2}){1,2}\])/g;
 
         let cursor = 0;
         let match;
@@ -652,6 +537,22 @@ function renderSummary(markdown) {
             }
 
             const token = match[0];
+
+            if (token.startsWith("[")) {
+                const label = token.slice(1, -1);
+                const button = document.createElement("button");
+
+                button.type = "button";
+                button.className = "ts-link";
+                button.dataset.seconds = String(timestampToSeconds(label));
+                button.style.cssText = TS_STYLE;
+                button.textContent = `▶ ${label}`;
+
+                parent.appendChild(button);
+                cursor = tokenPattern.lastIndex;
+                continue;
+            }
+
             const isBold = token.startsWith("**") || token.startsWith("__");
             const element = document.createElement(isBold ? "strong" : "em");
 
@@ -767,7 +668,8 @@ async function loadSummary() {
             method: "POST",
             body: {
                 video_id: videoId,
-                language: getSelectedLanguage()
+                language: getSelectedLanguage(),
+                video_url: state.videoUrl || $("urlInput")?.value.trim() || undefined
             }
         });
 
@@ -790,10 +692,46 @@ async function loadSummary() {
    15. CHAT MESSAGES
 ========================================= */
 
+const TS_STYLE =
+    "background:#e8f0fe;color:#1a56db;border:0;border-radius:999px;" +
+    "padding:1px 9px;margin:0 2px;font-size:.85em;font-weight:600;cursor:pointer;";
+
+function timestampToSeconds(label) {
+    const parts = label.split(":").map(Number);
+    return parts.length === 3
+        ? parts[0] * 3600 + parts[1] * 60 + parts[2]
+        : parts[0] * 60 + parts[1];
+}
+
 function formatAnswer(answer) {
     return escapeHtml(answer)
         .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+        .replace(
+            /\[(\d{1,2}(?::\d{2}){1,2})\]/g,
+            (match, label) =>
+                `<button type="button" class="ts-link" ` +
+                `data-seconds="${timestampToSeconds(label)}" ` +
+                `style="${TS_STYLE}" title="Video is time par chalao">▶ ${label}</button>`
+        )
         .replace(/\n/g, "<br>");
+}
+
+function seekVideo(seconds) {
+    if (!state.player || typeof state.player.seekTo !== "function") {
+        toast("Video player abhi ready nahi hai.", "error");
+        return;
+    }
+
+    state.player.seekTo(seconds, true);
+
+    if (typeof state.player.playVideo === "function") {
+        state.player.playVideo();
+    }
+
+    document.querySelector(".player-wrap")?.scrollIntoView({
+        behavior: "smooth",
+        block: "center"
+    });
 }
 
 function scrollChat() {
@@ -833,6 +771,7 @@ function resetChat() {
     if (!container) return;
 
     container.innerHTML = "";
+    state.history = [];
 
     addMessage(
         "ai",
@@ -872,18 +811,27 @@ async function handleSend(event) {
     );
 
     try {
+        const history = state.history.slice(-8);
+
         const data = await apiFetch(CONFIG.ENDPOINTS.chat, {
             method: "POST",
             body: {
                 video_id: state.videoId,
                 question: question,
-                language: getSelectedLanguage()
+                language: getSelectedLanguage(),
+                video_url: state.videoUrl || $("urlInput")?.value.trim() || undefined,
+                history: history
             }
         });
 
         typing?.remove();
 
-        addMessage("ai", formatAnswer(data.answer || "No answer received."));
+        const answerText = data.answer || "No answer received.";
+
+        state.history.push({ role: "user", content: question });
+        state.history.push({ role: "assistant", content: answerText.slice(0, 1500) });
+
+        addMessage("ai", formatAnswer(answerText));
 
     } catch (error) {
         typing?.remove();
@@ -929,6 +877,17 @@ function init() {
     // Theme
     initTheme();
 
+    // Click on any [MM:SS] button (chat or summary) -> jump the video there.
+    document.addEventListener("click", event => {
+        const button = event.target.closest(".ts-link");
+        if (!button) return;
+
+        const seconds = Number(button.dataset.seconds);
+        if (Number.isFinite(seconds)) {
+            seekVideo(seconds);
+        }
+    });
+
     $("themeToggle")?.addEventListener("click", () => {
         const current = document.documentElement.dataset.theme;
         applyTheme(current === "dark" ? "light" : "dark");
@@ -944,9 +903,6 @@ function init() {
 
     // Video form
     $("videoForm")?.addEventListener("submit", handleLoad);
-
-    // Manual transcript form
-    $("manualTranscriptForm")?.addEventListener("submit", handleManualTranscript);
 
     // Chat form
     $("chatForm")?.addEventListener("submit", handleSend);

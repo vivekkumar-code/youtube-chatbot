@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+numpy
+google-genai
+google-api-python-client
+youtube-transcript-api
+langchain-core
+langchain-groq
