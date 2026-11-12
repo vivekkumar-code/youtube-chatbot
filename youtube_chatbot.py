@@ -49,6 +49,8 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")  # optional (only for title/chann
 # in Render's Environment variables to a current model name.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "gemini-embedding-001")
+# Used automatically when the main model is overloaded (503) or unavailable.
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
 
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY missing in environment variables.")
@@ -334,26 +336,68 @@ def gemini_video_to_text(video_id: str) -> str:
     if media_resolution is not None and hasattr(media_resolution, "MEDIA_RESOLUTION_LOW"):
         config_kwargs["media_resolution"] = media_resolution.MEDIA_RESOLUTION_LOW
 
-    print(f"Asking Gemini ({GEMINI_MODEL}) to read the YouTube video...")
+    contents = types.Content(parts=[
+        types.Part(file_data=types.FileData(file_uri=video_url)),
+        types.Part(text=VIDEO_NOTES_PROMPT),
+    ])
 
-    try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=types.Content(parts=[
-                types.Part(file_data=types.FileData(file_uri=video_url)),
-                types.Part(text=VIDEO_NOTES_PROMPT),
-            ]),
-            config=types.GenerateContentConfig(**config_kwargs),
-        )
-    except Exception as exc:
-        message = str(exc).lower()
-        print("Gemini video error:", repr(exc))
+    models = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        models.append(GEMINI_FALLBACK_MODEL)
+
+    response = None
+    last_exc = None
+
+    for model_name in models:
+        # Up to 3 tries per model; wait a little when Google is overloaded.
+        for attempt in range(3):
+            try:
+                print(f"Asking Gemini ({model_name}) to read the video "
+                      f"(try {attempt + 1}/3)...")
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**config_kwargs),
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc).lower()
+                print("Gemini video error:", repr(exc))
+
+                overloaded = (
+                    "503" in message
+                    or "unavailable" in message
+                    or "overloaded" in message
+                    or "high demand" in message
+                    or "500" in message
+                    or "internal" in message
+                    or "deadline" in message
+                )
+
+                if overloaded and attempt < 2:
+                    time.sleep(8 * (attempt + 1))
+                    continue
+
+                # Not retryable (or retries used up): try the next model.
+                break
+
+        if response is not None:
+            break
+
+    if response is None:
+        message = str(last_exc).lower()
 
         if "getaddrinfo" in message or "11001" in message or "connecterror" in message \
                 or "connection" in message or "timed out" in message:
             raise ValueError(
                 "Internet/DNS problem: Gemini server tak request nahi pahunch paayi. "
                 "Internet check karo (DNS 8.8.8.8, VPN band) ya Render par chalao."
+            )
+        if "503" in message or "unavailable" in message or "high demand" in message:
+            raise ValueError(
+                "Gemini par abhi bahut load hai (Google ki taraf se temporary). "
+                "1-2 minute baad dobara Load Video dabao."
             )
         if "429" in message or "quota" in message or "resource_exhausted" in message:
             raise ValueError(
@@ -375,7 +419,7 @@ def gemini_video_to_text(video_id: str) -> str:
                 "Yeh video Gemini process nahi kar paya. Video public hona "
                 "chahiye (private/unlisted/age-restricted nahi)."
             )
-        raise ValueError(f"Gemini video processing failed: {exc}")
+        raise ValueError(f"Gemini video processing failed: {last_exc}")
 
     text = (getattr(response, "text", None) or "").strip()
 
