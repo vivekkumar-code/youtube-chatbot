@@ -54,6 +54,10 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "gemini-embedding-001")
 # Leave unset unless you know a valid model name (see /api/gemini-models).
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
 
+# Long videos are read in clips so the free per-minute token limit is not hit.
+SEGMENT_SECONDS = int(os.getenv("GEMINI_SEGMENT_SECONDS", "1200"))  # 20 min
+MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "7200"))     # 2 hours
+
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY missing in environment variables.")
 
@@ -198,6 +202,14 @@ def format_iso_duration(value: str) -> str:
     return f"{minutes}:{seconds:02d}"
 
 
+def iso_to_seconds(value: str):
+    match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value or "")
+    if not match:
+        return None
+    hours, minutes, seconds = (int(x or 0) for x in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
 def _oembed_info(video_id: str):
     """Title/channel without any API key (works from cloud servers too)."""
     try:
@@ -223,6 +235,7 @@ def get_video_info(video_id: str) -> dict:
         "description": "",
         "thumbnail": thumbnail,
         "duration": "",
+        "duration_seconds": None,
         "default_audio_language": None,
     }
 
@@ -242,6 +255,7 @@ def get_video_info(video_id: str) -> dict:
                     "description": snippet.get("description", ""),
                     "thumbnail": snippet.get("thumbnails", {}).get("high", {}).get("url", thumbnail),
                     "duration": format_iso_duration(items[0]["contentDetails"]["duration"]),
+                    "duration_seconds": iso_to_seconds(items[0]["contentDetails"]["duration"]),
                     "default_audio_language": (
                         snippet.get("defaultAudioLanguage") or snippet.get("defaultLanguage")
                     ),
@@ -347,12 +361,44 @@ RULES:
 """
 
 
-def gemini_video_to_text(video_id: str) -> str:
-    if gemini_client is None:
-        raise ValueError(
-            "YouTube ne captions nahi diye aur GEMINI_API_KEY set nahi hai."
-        )
+SEGMENT_NOTE = """
 
+IMPORTANT: this is only ONE PART of a longer video (part {index} of {total}).
+- Write notes only for what is in THIS part.
+- In this clip the time starts at 00:00, so write every [MM:SS] marker
+  relative to the start of THIS clip.
+- Do not write an overall introduction or conclusion for the whole video.
+"""
+
+_GEMINI_MARKER = re.compile(r"\[(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\]")
+
+
+def _marker_seconds(match) -> int:
+    return (
+        int(match.group(1) or 0) * 3600
+        + int(match.group(2)) * 60
+        + int(match.group(3))
+    )
+
+
+def _shift_markers(text: str, offset: int, clip_length: int) -> str:
+    """Turn clip-relative [MM:SS] markers into real video time."""
+    if offset <= 0:
+        return text
+
+    times = [_marker_seconds(m) for m in _GEMINI_MARKER.finditer(text)]
+
+    # If Gemini already wrote absolute video time, do not shift twice.
+    if not times or max(times) > clip_length + 90:
+        return text
+
+    return _GEMINI_MARKER.sub(
+        lambda m: f"[{format_timestamp(_marker_seconds(m) + offset)}]", text
+    )
+
+
+def _gemini_call(video_id: str, start=None, end=None, note="") -> str:
+    """One Gemini request for the whole video, or for a start..end clip (seconds)."""
     video_url = f"https://www.youtube.com/watch?v={video_id}"
 
     config_kwargs = {"temperature": 0.2}
@@ -362,9 +408,17 @@ def gemini_video_to_text(video_id: str) -> str:
     if media_resolution is not None and hasattr(media_resolution, "MEDIA_RESOLUTION_LOW"):
         config_kwargs["media_resolution"] = media_resolution.MEDIA_RESOLUTION_LOW
 
+    part_kwargs = {"file_data": types.FileData(file_uri=video_url)}
+
+    if start is not None and end is not None:
+        part_kwargs["video_metadata"] = types.VideoMetadata(
+            start_offset=f"{int(start)}s",
+            end_offset=f"{int(end)}s",
+        )
+
     contents = types.Content(parts=[
-        types.Part(file_data=types.FileData(file_uri=video_url)),
-        types.Part(text=VIDEO_NOTES_PROMPT),
+        types.Part(**part_kwargs),
+        types.Part(text=VIDEO_NOTES_PROMPT + note),
     ])
 
     models = [GEMINI_MODEL]
@@ -374,26 +428,38 @@ def gemini_video_to_text(video_id: str) -> str:
     response = None
     last_exc = None
     primary_exc = None
+    quota_waits = 0
 
     for model_name in models:
-        # Up to 3 tries per model; wait a little when Google is overloaded.
-        for attempt in range(3):
+        attempt = 0
+
+        while attempt < 3:
+            attempt += 1
+
             try:
-                print(f"Asking Gemini ({model_name}) to read the video "
-                      f"(try {attempt + 1}/3)...")
+                label = "" if start is None else f" [{int(start)}s-{int(end)}s]"
+                print(f"Asking Gemini ({model_name}){label} (try {attempt}/3)...")
+
                 response = gemini_client.models.generate_content(
                     model=model_name,
                     contents=contents,
                     config=types.GenerateContentConfig(**config_kwargs),
                 )
                 break
+
             except Exception as exc:
                 last_exc = exc
                 if model_name == models[0]:
                     primary_exc = exc
+
                 message = str(exc).lower()
                 print("Gemini video error:", repr(exc))
 
+                is_quota = (
+                    "429" in message
+                    or "resource_exhausted" in message
+                    or "quota" in message
+                )
                 overloaded = (
                     "503" in message
                     or "unavailable" in message
@@ -404,11 +470,18 @@ def gemini_video_to_text(video_id: str) -> str:
                     or "deadline" in message
                 )
 
-                if overloaded and attempt < 2:
-                    time.sleep(8 * (attempt + 1))
+                # Free-tier limit is per minute: wait for the window to reset.
+                if is_quota and quota_waits < 2:
+                    quota_waits += 1
+                    attempt -= 1
+                    _stage(video_id, "Gemini ki per-minute limit lagi hai, 1 minute ruk kar dobara try ho raha hai...")
+                    time.sleep(65)
                     continue
 
-                # Not retryable (or retries used up): try the next model.
+                if overloaded and attempt < 3:
+                    time.sleep(8 * attempt)
+                    continue
+
                 break
 
         if response is not None:
@@ -431,7 +504,9 @@ def gemini_video_to_text(video_id: str) -> str:
             )
         if "429" in message or "quota" in message or "resource_exhausted" in message:
             raise ValueError(
-                "Gemini ki free limit abhi poori ho gayi hai. Thodi der baad try karo."
+                "Gemini ki free limit poori ho gayi hai (per-minute ya daily). "
+                "Kuch der baad try karo, ya chhoti video chuno. "
+                "Usage dekhne ke liye aistudio.google.com/usage kholo."
             )
         if "404" in message and "model" in message:
             raise ValueError(
@@ -451,12 +526,72 @@ def gemini_video_to_text(video_id: str) -> str:
             )
         raise ValueError(f"Gemini video processing failed: {final_exc}")
 
-    text = (getattr(response, "text", None) or "").strip()
+    return (getattr(response, "text", None) or "").strip()
 
-    if len(text) < 200:
+
+def plan_segments(duration_seconds: int) -> list:
+    """Split a long video into ~SEGMENT_SECONDS clips (last clip never tiny)."""
+    segments = []
+    start = 0
+
+    while start < duration_seconds:
+        end = min(start + SEGMENT_SECONDS, duration_seconds)
+        if duration_seconds - end < 180:
+            end = duration_seconds
+        segments.append((start, end))
+        start = end
+
+    return segments
+
+
+def gemini_video_to_text(video_id: str, duration_seconds=None) -> str:
+    if gemini_client is None:
+        raise ValueError(
+            "YouTube ne captions nahi diye aur GEMINI_API_KEY set nahi hai."
+        )
+
+    if duration_seconds and duration_seconds > MAX_VIDEO_SECONDS:
+        raise ValueError(
+            f"Yeh video bahut lambi hai. Abhi {MAX_VIDEO_SECONDS // 3600} ghante "
+            "tak ki video chalti hai."
+        )
+
+    # Short video (or unknown length): one request.
+    if not duration_seconds or duration_seconds <= SEGMENT_SECONDS + 300:
+        text = _gemini_call(video_id)
+
+        if len(text) < 200:
+            raise ValueError("Gemini ko is video se kaafi content nahi mila.")
+
+        return text
+
+    # Long video: process in parts so the per-minute token limit is not hit.
+    segments = plan_segments(int(duration_seconds))
+    parts = []
+
+    for index, (start, end) in enumerate(segments, start=1):
+        _stage(
+            video_id,
+            f"Gemini video dekh raha hai: hissa {index}/{len(segments)} "
+            f"({format_timestamp(start)} - {format_timestamp(end)})...",
+        )
+
+        note = SEGMENT_NOTE.format(index=index, total=len(segments))
+        text = _gemini_call(video_id, start, end, note)
+        text = _shift_markers(text, start, end - start)
+
+        if len(text) >= 50:
+            parts.append(text)
+
+        if index < len(segments):
+            time.sleep(30)  # let the per-minute token window recover
+
+    combined = "\n\n".join(parts)
+
+    if len(combined) < 200:
         raise ValueError("Gemini ko is video se kaafi content nahi mila.")
 
-    return text
+    return combined
 
 
 def list_gemini_models() -> list:
@@ -735,7 +870,7 @@ def load_video(video_url: str) -> dict:
     # Try 2: Gemini reads the video directly from the YouTube link.
     if text is None:
         _stage(video_id, "Gemini video dekh raha hai (lambi video me kuch minute lag sakte hain)...")
-        text = gemini_video_to_text(video_id)
+        text = gemini_video_to_text(video_id, info.get("duration_seconds"))
         source = "gemini"
 
     return build_index(video_id, info, text, source, language)

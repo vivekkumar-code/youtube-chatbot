@@ -329,7 +329,7 @@ async function waitForVideo(videoId) {
     const startedAt = Date.now();
     let failures = 0;
 
-    while (Date.now() - startedAt < 20 * 60 * 1000) {
+    while (Date.now() - startedAt < 30 * 60 * 1000) {
         await new Promise(resolve => setTimeout(resolve, 3000));
 
         let status;
