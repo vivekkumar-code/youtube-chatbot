@@ -3,7 +3,9 @@ YouTube RAG chatbot (no manual transcript needed).
 
 How the video text is obtained (automatic, in this order):
   1. YouTube captions via youtube-transcript-api (fast, free).
-  2. If captions are blocked/unavailable (common on Render), the YouTube link
+  2. If captions are blocked on the server (common on Render), Supadata (if
+     SUPADATA_API_KEY is set) fetches the existing captions for us.
+  3. If that is not available either, the YouTube link
      is sent straight to the Gemini API, which watches/listens to the video on
      Google's servers and returns detailed notes of everything said and shown.
 
@@ -19,8 +21,9 @@ import time
 import gc
 import threading
 from collections import OrderedDict
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 from urllib.request import urlopen, Request
+from urllib.error import HTTPError
 
 import numpy as np
 from dotenv import load_dotenv
@@ -43,7 +46,9 @@ load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")  # optional (only for title/channel)
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")  # optional (title/channel/duration)
+# Optional: transcript service that works from cloud servers (supadata.ai).
+SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY")
 
 # Model names are configurable because Google renames/retires models.
 # If you get a "model not found" error, set GEMINI_MODEL / EMBED_MODEL
@@ -331,6 +336,110 @@ def fetch_captions(video_id: str, preferred_language=None) -> dict:
         raise ValueError("Transcript is empty.")
 
     return {"text": text, "language": selected.language}
+
+
+# =========================================================
+# STEP 1b: SUPADATA (existing captions, fetched from their servers)
+# =========================================================
+
+def _supadata_request(path: str):
+    request = Request(
+        "https://api.supadata.ai" + path,
+        headers={
+            "x-api-key": SUPADATA_API_KEY,
+            "Accept": "application/json",
+            "User-Agent": "youtube-chatbot/1.0",
+        },
+    )
+    with urlopen(request, timeout=60) as response:
+        body = response.read().decode("utf-8") or "{}"
+        return response.status, json.loads(body)
+
+
+def _supadata_poll(job_id: str, timeout=150) -> dict:
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        _, data = _supadata_request(f"/v1/transcript/{job_id}")
+        state = data.get("status")
+
+        if state == "completed":
+            return data
+        if state == "failed":
+            raise ValueError(f"Supadata job failed: {data.get('error')}")
+
+        time.sleep(2)
+
+    raise ValueError("Supadata job time out.")
+
+
+def _pairs_to_marked_text(pairs: list, block_seconds=25) -> str:
+    """pairs = [(start_seconds, text)] -> one '[MM:SS] text' line per ~25s."""
+    lines = []
+    block_start = None
+    block_text = []
+
+    for start, piece in pairs:
+        piece = (piece or "").strip().replace("\n", " ")
+        if not piece:
+            continue
+
+        if block_start is None:
+            block_start = start
+        elif start - block_start >= block_seconds:
+            lines.append(f"[{format_timestamp(block_start)}] {' '.join(block_text)}")
+            block_start = start
+            block_text = []
+
+        block_text.append(piece)
+
+    if block_text:
+        lines.append(f"[{format_timestamp(block_start)}] {' '.join(block_text)}")
+
+    return "\n".join(lines)
+
+
+def fetch_supadata_transcript(video_id: str, preferred_language=None) -> dict:
+    if not SUPADATA_API_KEY:
+        raise ValueError("SUPADATA_API_KEY set nahi hai.")
+
+    # mode=native: only existing captions (1 credit), never paid AI generation.
+    query = {
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "mode": "native",
+    }
+    if preferred_language:
+        query["lang"] = preferred_language.lower().split("-")[0]
+
+    try:
+        status, data = _supadata_request("/v1/transcript?" + urlencode(query))
+
+        if status == 202 and data.get("jobId"):
+            data = _supadata_poll(data["jobId"])
+
+    except HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8")[:200]
+        except Exception:
+            pass
+        raise ValueError(f"Supadata error {exc.code}: {detail}")
+
+    content = data.get("content")
+
+    if isinstance(content, list) and content:
+        pairs = [
+            (float(item.get("offset", 0)) / 1000.0, item.get("text", ""))
+            for item in content
+            if isinstance(item, dict)
+        ]
+        text = _pairs_to_marked_text(pairs)
+    elif isinstance(content, str) and content.strip():
+        text = content.strip()
+    else:
+        raise ValueError("Supadata ko is video ka transcript nahi mila.")
+
+    return {"text": text, "language": data.get("lang") or "Unknown"}
 
 
 # =========================================================
@@ -666,7 +775,7 @@ def split_into_chunks(text: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> list
     return chunks
 
 
-def embed_texts(texts: list, task_type: str) -> np.ndarray:
+def embed_texts(texts: list, task_type: str, retries: int = 3) -> np.ndarray:
     if gemini_client is None:
         raise RuntimeError("Gemini client not configured.")
 
@@ -676,7 +785,7 @@ def embed_texts(texts: list, task_type: str) -> np.ndarray:
     for start in range(0, len(texts), batch_size):
         batch = texts[start:start + batch_size]
 
-        for attempt in range(3):
+        for attempt in range(retries):
             try:
                 response = gemini_client.models.embed_content(
                     model=EMBED_MODEL,
@@ -688,7 +797,7 @@ def embed_texts(texts: list, task_type: str) -> np.ndarray:
             except Exception as exc:
                 message = str(exc).lower()
                 is_rate_limit = "429" in message or "quota" in message or "resource_exhausted" in message
-                if attempt == 2 or not is_rate_limit:
+                if attempt >= retries - 1 or not is_rate_limit:
                     raise
                 time.sleep(20 * (attempt + 1))
 
@@ -721,7 +830,7 @@ def search_chunks(video_data: dict, query: str, k=TOP_K) -> list:
 
     if embeddings is not None:
         try:
-            query_vector = embed_texts([query], "RETRIEVAL_QUERY")[0]
+            query_vector = embed_texts([query], "RETRIEVAL_QUERY", retries=1)[0]
             scores = embeddings @ query_vector
         except Exception as exc:
             print("Embedding search failed, using keyword search:", repr(exc))
@@ -857,7 +966,7 @@ def load_video(video_url: str) -> dict:
     source = None
     language = "Unknown"
 
-    # Try 1: YouTube captions.
+    # Try 1: YouTube captions (usually blocked on cloud servers).
     try:
         captions = fetch_captions(video_id, info.get("default_audio_language"))
         if len(captions["text"]) >= 200:
@@ -867,7 +976,19 @@ def load_video(video_url: str) -> dict:
     except Exception as exc:
         print(f"Captions unavailable: {exc}")
 
-    # Try 2: Gemini reads the video directly from the YouTube link.
+    # Try 2: Supadata (existing captions via their servers, works on Render).
+    if text is None and SUPADATA_API_KEY:
+        try:
+            _stage(video_id, "Transcript Supadata se liya ja raha hai...")
+            result = fetch_supadata_transcript(video_id, info.get("default_audio_language"))
+            if len(result["text"]) >= 200:
+                text = result["text"]
+                language = result["language"]
+                source = "supadata"
+        except Exception as exc:
+            print(f"Supadata unavailable: {exc}")
+
+    # Try 3: Gemini reads the video directly from the YouTube link.
     if text is None:
         _stage(video_id, "Gemini video dekh raha hai (lambi video me kuch minute lag sakte hain)...")
         text = gemini_video_to_text(video_id, info.get("duration_seconds"))

@@ -12,6 +12,7 @@ from youtube_chatbot import (
     generate_summary,
     GEMINI_MODEL,
     gemini_client,
+    SUPADATA_API_KEY,
 )
 
 
@@ -94,6 +95,7 @@ def health_check():
         "status": "healthy",
         "service": "YouTube AI Chatbot RAG",
         "gemini_configured": gemini_client is not None,
+        "supadata_configured": bool(SUPADATA_API_KEY),
         "gemini_model": GEMINI_MODEL,
     }
 
