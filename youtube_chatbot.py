@@ -50,8 +50,9 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")  # optional (only for title/chann
 # in Render's Environment variables to a current model name.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "gemini-embedding-001")
-# Used automatically when the main model is overloaded (503) or unavailable.
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
+# Optional second model, used only if the main one keeps failing.
+# Leave unset unless you know a valid model name (see /api/gemini-models).
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
 
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY missing in environment variables.")
@@ -372,6 +373,7 @@ def gemini_video_to_text(video_id: str) -> str:
 
     response = None
     last_exc = None
+    primary_exc = None
 
     for model_name in models:
         # Up to 3 tries per model; wait a little when Google is overloaded.
@@ -387,6 +389,8 @@ def gemini_video_to_text(video_id: str) -> str:
                 break
             except Exception as exc:
                 last_exc = exc
+                if model_name == models[0]:
+                    primary_exc = exc
                 message = str(exc).lower()
                 print("Gemini video error:", repr(exc))
 
@@ -411,7 +415,8 @@ def gemini_video_to_text(video_id: str) -> str:
             break
 
     if response is None:
-        message = str(last_exc).lower()
+        final_exc = primary_exc or last_exc
+        message = str(final_exc).lower()
 
         if "getaddrinfo" in message or "11001" in message or "connecterror" in message \
                 or "connection" in message or "timed out" in message:
@@ -444,7 +449,7 @@ def gemini_video_to_text(video_id: str) -> str:
                 "Yeh video Gemini process nahi kar paya. Video public hona "
                 "chahiye (private/unlisted/age-restricted nahi)."
             )
-        raise ValueError(f"Gemini video processing failed: {last_exc}")
+        raise ValueError(f"Gemini video processing failed: {final_exc}")
 
     text = (getattr(response, "text", None) or "").strip()
 
@@ -452,6 +457,20 @@ def gemini_video_to_text(video_id: str) -> str:
         raise ValueError("Gemini ko is video se kaafi content nahi mila.")
 
     return text
+
+
+def list_gemini_models() -> list:
+    """Model names this API key can use for generateContent."""
+    if gemini_client is None:
+        raise ValueError("GEMINI_API_KEY set nahi hai.")
+
+    names = []
+    for model in gemini_client.models.list():
+        actions = getattr(model, "supported_actions", None) or []
+        if not actions or "generateContent" in actions:
+            names.append((getattr(model, "name", "") or "").replace("models/", ""))
+
+    return sorted(set(n for n in names if n))
 
 
 # =========================================================

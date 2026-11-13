@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from youtube_chatbot import (
     start_load_job,
     get_job_status,
+    list_gemini_models,
     ask_question,
     generate_summary,
     GEMINI_MODEL,
@@ -95,6 +96,20 @@ def health_check():
         "gemini_configured": gemini_client is not None,
         "gemini_model": GEMINI_MODEL,
     }
+
+
+@app.get("/api/gemini-models")
+def gemini_models():
+    """Shows which Gemini model names work with your key (for GEMINI_MODEL)."""
+    try:
+        return {
+            "configured_model": GEMINI_MODEL,
+            "available_models": list_gemini_models(),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not list models: {exc}")
 
 
 # =========================================
