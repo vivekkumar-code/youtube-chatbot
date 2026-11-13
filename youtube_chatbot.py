@@ -118,10 +118,19 @@ llm = ChatGroq(
     api_key=GROQ_API_KEY,
 )
 
+# The model "thinks" first, and thinking uses up max_tokens. With too small a
+# limit nothing is left for the real answer and the summary comes back empty.
 summary_llm = ChatGroq(
     model="openai/gpt-oss-20b",
     temperature=0,
-    max_tokens=1000,
+    max_tokens=2500,
+    api_key=GROQ_API_KEY,
+)
+
+summary_llm_big = ChatGroq(
+    model="openai/gpt-oss-20b",
+    temperature=0,
+    max_tokens=4500,
     api_key=GROQ_API_KEY,
 )
 
@@ -1083,7 +1092,8 @@ You are given VIDEO CONTENT (the most relevant parts of the video) and the
 recent CHAT HISTORY.
 
 HOW TO ANSWER:
-1. Answer the actual question directly first, in one or two lines.
+1. Start by answering the question directly in the first one or two lines.
+   Do NOT write a label or heading such as "Answer" - just write it naturally.
 2. Then explain clearly, step by step, like a good teacher: simple words,
    short paragraphs, bullets or numbered steps where they help. Reuse the
    video's own examples and analogies.
@@ -1100,7 +1110,10 @@ HOW TO ANSWER:
    with a one-line recap.
 7. Do not mention "context", "chunks" or "retrieval". Say "video me" /
    "in the video" instead.
-8. TIMESTAMPS: the VIDEO CONTENT has time markers like [05:32] showing where
+8. FORMAT: plain, chat-friendly text. Use short paragraphs and simple bullet
+   points that start with "- ". NEVER use tables, "---" lines or "#" headings.
+   Use **bold** only for a few key terms.
+9. TIMESTAMPS: the VIDEO CONTENT has time markers like [05:32] showing where
    each part is in the video. Tell the student WHEN the topic was discussed,
    e.g. "Yeh video me [05:32] par samjhaya gaya hai". Write every time
    exactly as [MM:SS] (or [H:MM:SS]) and use ONLY markers that appear in the
@@ -1278,12 +1291,22 @@ VIDEO NOTES / SOURCE:
 {content}
 """)
 
-    final_chain = final_prompt | summary_llm | StrOutputParser()
-
-    summary = invoke_summary_with_retry(final_chain, {
+    payload = {
         "content": source_content,
         "language": language,
         "language_instruction": language_instruction,
-    })
+    }
 
-    return summary.strip()
+    final_chain = final_prompt | summary_llm | StrOutputParser()
+    summary = (invoke_summary_with_retry(final_chain, payload) or "").strip()
+
+    if not summary:
+        # Empty answer = token budget used up by thinking. Retry with more room.
+        print("Summary came back empty, retrying with a bigger token limit...")
+        big_chain = final_prompt | summary_llm_big | StrOutputParser()
+        summary = (invoke_summary_with_retry(big_chain, payload) or "").strip()
+
+    if not summary:
+        raise ValueError("Summary nahi ban payi. Thodi der baad dobara try karo.")
+
+    return summary

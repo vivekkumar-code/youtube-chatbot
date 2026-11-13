@@ -747,8 +747,25 @@ function timestampToSeconds(label) {
         : parts[0] * 60 + parts[1];
 }
 
+function cleanMarkdown(text) {
+    return String(text || "")
+        // "---" lines and table separator rows like |------|------|
+        .replace(/^[ \t]*[-*_]{3,}[ \t]*$/gm, "")
+        .replace(/^[ \t]*\|?[ \t]*:?-{2,}[-:| \t]*$/gm, "")
+        // table rows -> "a — b"
+        .replace(/^[ \t]*\|(.+)\|[ \t]*$/gm, (match, row) =>
+            row.split("|").map(cell => cell.trim()).filter(Boolean).join(" — ")
+        )
+        // headings -> bold
+        .replace(/^[ \t]*#{1,6}[ \t]*(.+)$/gm, "**$1**")
+        // bullets -> •
+        .replace(/^[ \t]*[-*][ \t]+/gm, "• ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+}
+
 function formatAnswer(answer) {
-    return escapeHtml(answer)
+    return escapeHtml(cleanMarkdown(answer))
         .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
         .replace(
             /\[(\d{1,2}(?::\d{2}){1,2})\]/g,
