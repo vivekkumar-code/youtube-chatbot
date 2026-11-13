@@ -17,6 +17,7 @@ import re
 import json
 import time
 import gc
+import threading
 from collections import OrderedDict
 from urllib.parse import urlparse, parse_qs
 from urllib.request import urlopen, Request
@@ -59,7 +60,20 @@ if not GEMINI_API_KEY:
     print("WARNING: GEMINI_API_KEY not set. Only YouTube captions / manual "
           "transcript will work (no Gemini video fallback, no embeddings).")
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+def _make_gemini_client():
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        # Reading a long video can take several minutes (timeout is in ms).
+        return genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options=types.HttpOptions(timeout=600_000),
+        )
+    except Exception:
+        return genai.Client(api_key=GEMINI_API_KEY)
+
+
+gemini_client = _make_gemini_client()
 
 SUPPORTED_LANGUAGES = ["English", "Hindi", "Hinglish"]
 
@@ -73,6 +87,17 @@ TOP_K = 6
 
 VIDEO_CACHE = OrderedDict()
 MAX_CACHED_VIDEOS = 3
+
+# Background loading jobs: video_id -> {"state", "stage", "error"}
+JOBS = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _stage(video_id: str, message: str):
+    job = JOBS.get(video_id)
+    if job and job.get("state") == "processing":
+        job["stage"] = message
+    print(f"[{video_id}] {message}")
 
 print("Initializing Groq LLM...")
 
@@ -623,6 +648,7 @@ def _load_from_disk(video_id: str):
 
 
 def build_index(video_id: str, info: dict, text: str, source: str, language: str) -> dict:
+    _stage(video_id, "Video ka searchable index ban raha hai...")
     chunks = split_into_chunks(text)
 
     if not chunks:
@@ -670,6 +696,7 @@ def load_video(video_url: str) -> dict:
         _remember(video_id, saved)
         return saved
 
+    _stage(video_id, "Video ki details aur captions check ho rahe hain...")
     info = get_video_info(video_id)
 
     text = None
@@ -678,7 +705,6 @@ def load_video(video_url: str) -> dict:
 
     # Try 1: YouTube captions.
     try:
-        print("Trying YouTube captions...")
         captions = fetch_captions(video_id, info.get("default_audio_language"))
         if len(captions["text"]) >= 200:
             text = captions["text"]
@@ -689,6 +715,7 @@ def load_video(video_url: str) -> dict:
 
     # Try 2: Gemini reads the video directly from the YouTube link.
     if text is None:
+        _stage(video_id, "Gemini video dekh raha hai (lambi video me kuch minute lag sakte hain)...")
         text = gemini_video_to_text(video_id)
         source = "gemini"
 
@@ -710,6 +737,63 @@ def ensure_loaded(video_id: str, video_url=None) -> dict:
         return load_video(video_url)
 
     raise ValueError("Video is not loaded. Please load it again.")
+
+
+# =========================================================
+# BACKGROUND LOADING (so no single request can time out)
+# =========================================================
+
+def _run_job(video_id: str, video_url: str):
+    try:
+        load_video(video_url)
+        JOBS[video_id].update({"state": "done", "stage": "Ho gaya", "error": None})
+    except ValueError as exc:
+        JOBS[video_id].update({"state": "error", "error": str(exc)})
+    except Exception as exc:
+        print("Load job failed:", repr(exc))
+        JOBS[video_id].update({"state": "error", "error": f"Video loading failed: {exc}"})
+
+
+def start_load_job(video_url: str) -> dict:
+    """Start loading a video in the background (instant if already loaded)."""
+    video_id = extract_video_id(video_url)  # raises ValueError for bad links
+
+    if video_id in VIDEO_CACHE or _load_from_disk(video_id) is not None:
+        load_video(video_url)
+        return {"video_id": video_id}
+
+    with _JOBS_LOCK:
+        job = JOBS.get(video_id)
+
+        if job is None or job["state"] in ("error", "done"):
+            JOBS[video_id] = {
+                "state": "processing",
+                "stage": "Shuru ho raha hai...",
+                "error": None,
+            }
+            threading.Thread(
+                target=_run_job, args=(video_id, video_url), daemon=True
+            ).start()
+
+    return {"video_id": video_id}
+
+
+def get_job_status(video_id: str) -> dict:
+    data = VIDEO_CACHE.get(video_id)
+
+    if data is None:
+        data = _load_from_disk(video_id)
+        if data is not None:
+            _remember(video_id, data)
+
+    if data is not None:
+        return {"state": "done", "stage": "Ho gaya", "error": None, "data": data}
+
+    job = JOBS.get(video_id)
+    if job:
+        return {"state": job["state"], "stage": job["stage"], "error": job["error"]}
+
+    return {"state": "unknown", "stage": None, "error": None}
 
 
 # =========================================================

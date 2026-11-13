@@ -1,11 +1,12 @@
 from typing import List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from youtube_chatbot import (
-    load_video,
+    start_load_job,
+    get_job_status,
     ask_question,
     generate_summary,
     GEMINI_MODEL,
@@ -97,26 +98,38 @@ def health_check():
 
 
 # =========================================
-# 5. LOAD YOUTUBE VIDEO (link only)
+# 5. LOAD YOUTUBE VIDEO (background job + status polling)
 # =========================================
+
+def _status_payload(video_id: str) -> dict:
+    status = get_job_status(video_id)
+
+    payload = {
+        "status": "success",
+        "video_id": video_id,
+        "state": status["state"],
+        "stage": status.get("stage"),
+        "error": status.get("error"),
+        "summary": None,
+        "summary_error": None,
+    }
+
+    if status["state"] == "done":
+        data = status["data"]
+        payload.update({
+            "video": data["video"],
+            "source": data["source"],
+            "chunks_indexed": len(data["chunks"]),
+        })
+
+    return payload
+
 
 @app.post("/api/load-video")
 def load_youtube_video(request: VideoRequest):
     try:
-        data = load_video(request.video_url)
-
-        video = data["video"]
-
-        return {
-            "status": "success",
-            "message": "Video loaded successfully",
-            "video": video,
-            "video_id": video["video_id"],
-            "source": data["source"],
-            "chunks_indexed": len(data["chunks"]),
-            "summary": None,
-            "summary_error": None,
-        }
+        job = start_load_job(request.video_url)
+        return _status_payload(job["video_id"])
 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -127,6 +140,11 @@ def load_youtube_video(request: VideoRequest):
             status_code=500,
             detail=f"Video loading failed: {str(exc)}",
         )
+
+
+@app.get("/api/load-status/{video_id}")
+def load_status(video_id: str = Path(min_length=11, max_length=11)):
+    return _status_payload(video_id)
 
 
 # =========================================

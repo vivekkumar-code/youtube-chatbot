@@ -9,7 +9,6 @@ const IS_LOCAL =
     location.hostname === "127.0.0.1";
 
 const CONFIG = {
-    // TODO: "TUMHARA-APP" ki jagah apna asli Render URL daalo
     API_BASE_URL: IS_LOCAL
         ? "http://127.0.0.1:8000"
         : "https://youtube-chatbot-6kzr.onrender.com",
@@ -17,6 +16,7 @@ const CONFIG = {
     ENDPOINTS: {
         health: "/health",
         loadVideo: "/api/load-video",
+        loadStatus: "/api/load-status/",
         summary: "/api/summary",
         chat: "/api/chat"
     },
@@ -325,6 +325,46 @@ function setLoading(isLoading, message = "") {
    9. LOAD YOUTUBE VIDEO
 ========================================= */
 
+async function waitForVideo(videoId) {
+    const startedAt = Date.now();
+    let failures = 0;
+
+    while (Date.now() - startedAt < 20 * 60 * 1000) {
+        await new Promise(resolve => setTimeout(resolve, 3000));
+
+        let status;
+
+        try {
+            status = await apiFetch(CONFIG.ENDPOINTS.loadStatus + videoId);
+            failures = 0;
+        } catch (error) {
+            failures += 1;
+            if (failures >= 6) throw error;
+            continue;
+        }
+
+        if (status.state === "done") return status;
+
+        if (status.state === "error") {
+            throw new Error(status.error || "Video load nahi ho paya.");
+        }
+
+        if (status.state === "unknown") {
+            throw new Error(
+                "Server restart ho gaya tha. Link dobara daal ke Load Video dabao."
+            );
+        }
+
+        if (status.stage) {
+            setLoading(true, status.stage);
+        }
+    }
+
+    throw new Error(
+        "Video process hone me bahut time lag gaya. Chhoti video try karo."
+    );
+}
+
 async function handleLoad(event) {
     event.preventDefault();
 
@@ -349,13 +389,17 @@ async function handleLoad(event) {
     setLoading(true, "Video samjha ja raha hai (pehli baar 1-2 minute lag sakte hain)...");
 
     try {
-        const data = await apiFetch(CONFIG.ENDPOINTS.loadVideo, {
+        let data = await apiFetch(CONFIG.ENDPOINTS.loadVideo, {
             method: "POST",
             body: {
                 video_url: url,
                 language: language
             }
         });
+
+        if (data.state !== "done") {
+            data = await waitForVideo(data.video_id);
+        }
 
         if (!data.video_id) {
             throw new Error("Video ID missing from backend response.");
