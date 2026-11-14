@@ -1038,6 +1038,19 @@ def _run_job(video_id: str, video_url: str):
         JOBS[video_id].update({"state": "error", "error": f"Video loading failed: {exc}"})
 
 
+def needs_processing(video_id: str) -> bool:
+    """True only if loading this video will really spend API quota
+    (not cached, not saved on disk, not already being processed)."""
+    if video_id in VIDEO_CACHE:
+        return False
+
+    job = JOBS.get(video_id)
+    if job and job["state"] == "processing":
+        return False
+
+    return _load_from_disk(video_id) is None
+
+
 def start_load_job(video_url: str) -> dict:
     """Start loading a video in the background (instant if already loaded)."""
     video_id = extract_video_id(video_url)  # raises ValueError for bad links
